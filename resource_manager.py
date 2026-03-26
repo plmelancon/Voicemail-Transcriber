@@ -1,11 +1,14 @@
 # -*- coding: utf-8 -*-
 """
 Resource Manager for Voicemail Transcriber Service
-Handles process priority and Whisper model lifecycle (faster-whisper).
+Handles process priority and Whisper model lifecycle.
+Supports two backends: faster-whisper (CPU) and OpenVINO GenAI (NPU).
 """
 
 import gc
+import json
 import logging
+import os
 import sys as _sys
 import threading
 import time
@@ -15,6 +18,37 @@ import win32api
 import win32process
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Settings persistence
+# ---------------------------------------------------------------------------
+SETTINGS_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "VoicemailTranscriber"
+SETTINGS_FILE = SETTINGS_DIR / "settings.json"
+
+
+def load_settings() -> dict:
+    """Load settings from disk. Returns defaults if file doesn't exist."""
+    defaults = {"device": "auto"}
+    try:
+        if SETTINGS_FILE.exists():
+            with open(SETTINGS_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            # Merge with defaults for any missing keys
+            return {**defaults, **data}
+    except Exception as e:
+        logger.warning(f"Could not load settings: {e}")
+    return defaults
+
+
+def save_settings(settings: dict):
+    """Save settings to disk."""
+    try:
+        SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(settings, f, indent=2)
+        logger.info(f"Settings saved: {settings}")
+    except Exception as e:
+        logger.error(f"Could not save settings: {e}")
 
 # ---------------------------------------------------------------------------
 # Process priority helpers
@@ -164,3 +198,211 @@ class WhisperModelManager:
             except ImportError:
                 pass
             logger.info("Model unloaded, memory freed")
+
+
+# ---------------------------------------------------------------------------
+# NPU Whisper model manager (OpenVINO GenAI)
+# ---------------------------------------------------------------------------
+
+def _load_audio_16k(audio_path: str):
+    """Load an audio file and resample to 16 kHz mono float32.
+
+    Tries soundfile first (WAV/FLAC/OGG), falls back to PyAV for
+    formats soundfile can't handle (MP4/M4A/MP3/WMA/etc.).
+    """
+    import numpy as np
+    import soxr
+
+    try:
+        import soundfile as sf
+        data, sr = sf.read(audio_path, dtype="float32", always_2d=True)
+    except Exception:
+        # Fallback: decode with PyAV (FFmpeg) for MP4/M4A/MP3/etc.
+        data, sr = _load_audio_av(audio_path)
+
+    # Mix to mono
+    if data.ndim > 1 and data.shape[1] > 1:
+        data = data.mean(axis=1)
+    elif data.ndim > 1:
+        data = data[:, 0]
+    # Resample to 16 kHz if needed
+    if sr != 16000:
+        data = soxr.resample(data, sr, 16000)
+    return data
+
+
+def _load_audio_av(audio_path: str):
+    """Load audio using PyAV (FFmpeg). Returns (float32 ndarray, sample_rate)."""
+    import av
+    import numpy as np
+
+    container = av.open(audio_path)
+    stream = container.streams.audio[0]
+    sr = stream.rate or stream.codec_context.sample_rate
+
+    frames = []
+    for frame in container.decode(audio=0):
+        arr = frame.to_ndarray()
+        # av returns shape (channels, samples) for planar, (samples, channels) for interleaved
+        if arr.ndim == 2 and arr.shape[0] < arr.shape[1]:
+            arr = arr.T  # channels-first → samples-first
+        frames.append(arr)
+    container.close()
+
+    data = np.concatenate(frames, axis=0).astype(np.float32)
+    # Normalize int formats to [-1, 1] range
+    if data.max() > 1.0 or data.min() < -1.0:
+        max_val = max(abs(data.max()), abs(data.min()))
+        if max_val > 0:
+            data = data / max_val
+    if data.ndim == 1:
+        data = data.reshape(-1, 1)
+    return data, sr
+
+
+class NpuWhisperManager:
+    """Whisper transcription backend using Intel NPU via OpenVINO GenAI.
+
+    Same ``transcribe(audio_path) -> str`` interface as WhisperModelManager
+    so it can be swapped in transparently.
+
+    Features:
+        - Background pipeline loading at startup (non-blocking)
+        - Pipeline stays loaded permanently (no idle timeout)
+        - Thread-safe (guarded by a Lock)
+    """
+
+    MODEL_DIR = Path("C:/whisper-npu/models/whisper-large-v3-turbo-int8")
+    DEVICE = "NPU"
+
+    def __init__(self, model_name: str = "turbo", language: str = "fr"):
+        self.model_name = model_name  # kept for interface compatibility
+        self.language = language
+        self._model = None
+        self._lock = threading.Lock()
+        self._ready = threading.Event()
+        self._load_error: str | None = None
+        # Start loading immediately in background
+        self._loader = threading.Thread(
+            target=self._background_load, name="NPU-Loader", daemon=True
+        )
+        self._loader.start()
+
+    def _background_load(self):
+        """Load the pipeline in a background thread so the UI stays responsive."""
+        try:
+            import openvino_genai
+            logger.info(f"Loading OpenVINO Whisper pipeline on {self.DEVICE}...")
+            logger.info(f"  Model: {self.MODEL_DIR}")
+            logger.info("  First load compiles for NPU — may take 2-3 minutes.")
+            start = time.time()
+            pipe = openvino_genai.WhisperPipeline(
+                str(self.MODEL_DIR), self.DEVICE
+            )
+            with self._lock:
+                self._model = pipe
+            logger.info(f"Pipeline ready in {time.time() - start:.1f}s")
+        except Exception as e:
+            self._load_error = str(e)
+            logger.error(f"Failed to load NPU pipeline: {e}")
+        finally:
+            self._ready.set()
+
+    # -- public interface (duck-type compatible with WhisperTranscriber) ------
+
+    def load_model(self):
+        """Wait for the background load to finish, then return the pipeline."""
+        self._ready.wait()
+        if self._load_error:
+            raise RuntimeError(f"NPU pipeline failed to load: {self._load_error}")
+        return self._model
+
+    def transcribe(self, audio_path: str) -> str:
+        """Transcribe an audio file and return the text.
+
+        Waits for the pipeline to be ready (background load), then runs
+        inference under the lock (NPU is not thread-safe).
+        """
+        self._ready.wait()
+        if self._load_error:
+            raise RuntimeError(f"NPU pipeline failed to load: {self._load_error}")
+
+        with self._lock:
+            logger.info(f"Transcribing: {audio_path}")
+            try:
+                speech = _load_audio_16k(audio_path)
+
+                config = self._model.get_generation_config()
+                config.task = "transcribe"
+                config.language = f"<|{self.language}|>"
+                config.max_new_tokens = 448
+
+                result = self._model.generate(speech, config)
+                text = str(result).strip()
+                logger.info(f"Transcription complete: {len(text)} characters")
+                return text
+            except Exception as e:
+                logger.error(f"Transcription error: {e}")
+                raise
+
+    def force_unload(self):
+        """Immediately unload the pipeline and free resources."""
+        with self._lock:
+            self._do_unload()
+
+    # -- internal ------------------------------------------------------------
+
+    def _do_unload(self):
+        if self._model is not None:
+            logger.info("Unloading Whisper NPU pipeline (idle timeout)...")
+            del self._model
+            self._model = None
+            gc.collect()
+            logger.info("Pipeline unloaded, memory freed")
+
+
+# ---------------------------------------------------------------------------
+# Factory: create the right transcriber based on device preference
+# ---------------------------------------------------------------------------
+
+def is_npu_available() -> bool:
+    """Check if Intel NPU is available via OpenVINO."""
+    try:
+        import openvino as ov
+        core = ov.Core()
+        return "NPU" in core.available_devices
+    except Exception:
+        return False
+
+
+def create_transcriber(device_pref: str = "auto", language: str = "fr"):
+    """Create the appropriate transcriber backend.
+
+    Parameters
+    ----------
+    device_pref : str
+        ``"auto"`` — try NPU, fall back to CPU.
+        ``"npu"``  — force OpenVINO NPU.
+        ``"cpu"``  — force faster-whisper on CPU.
+    language : str
+        Language code for transcription (default: ``"fr"``).
+
+    Returns
+    -------
+    WhisperModelManager or NpuWhisperManager
+    """
+    if device_pref == "npu":
+        logger.info("Device preference: NPU (forced)")
+        return NpuWhisperManager(language=language)
+
+    if device_pref == "cpu":
+        logger.info("Device preference: CPU (forced)")
+        return WhisperModelManager(language=language)
+
+    # auto: try NPU first
+    if is_npu_available() and NpuWhisperManager.MODEL_DIR.exists():
+        logger.info("Device preference: auto → NPU available, using NPU")
+        return NpuWhisperManager(language=language)
+    else:
+        logger.info("Device preference: auto → NPU not available, falling back to CPU")
+        return WhisperModelManager(language=language)

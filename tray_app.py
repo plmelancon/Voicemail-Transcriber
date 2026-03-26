@@ -56,15 +56,21 @@ class VoicemailTrayApp:
         The running monitor instance (for pause/resume/stop).
     processor : OutlookVoicemailProcessor
         The processor (for manual scan action).
+    device_pref : str
+        Current device preference (``"auto"``, ``"npu"``, ``"cpu"``).
     """
 
-    def __init__(self, monitor, processor):
+    def __init__(self, monitor, processor, device_pref: str = "auto"):
         self.monitor = monitor
         self.processor = processor
+        self._device_pref = device_pref
         self._state = "idle"
         self._detail = ""
         self._icon: pystray.Icon | None = None
         self._revert_timer: threading.Timer | None = None
+        # Probe NPU availability once at startup
+        from resource_manager import is_npu_available
+        self._npu_available = is_npu_available()
 
     # -- Icon image generation -----------------------------------------------
 
@@ -162,6 +168,35 @@ class VoicemailTrayApp:
 
         threading.Thread(target=_scan, name="ManualScan", daemon=True).start()
 
+    def _switch_device(self, device_pref: str):
+        """Switch the transcription backend (auto/npu/cpu)."""
+        def _do_switch():
+            from resource_manager import save_settings, create_transcriber
+            old = self._device_pref
+            if device_pref == old:
+                return
+            self._device_pref = device_pref
+            save_settings({"device": device_pref})
+
+            # Unload old transcriber
+            try:
+                self.processor.transcriber.force_unload()
+            except Exception:
+                pass
+
+            # Create new one
+            language = getattr(self.processor, "config", {}).get("language", "fr")
+            self.processor.transcriber = create_transcriber(device_pref, language=language)
+
+            labels = {"auto": "Auto", "npu": "NPU", "cpu": "CPU"}
+            self._show_notification(
+                "Moteur de transcription",
+                f"Changé: {labels.get(old, old)} → {labels.get(device_pref, device_pref)}"
+            )
+            logger.info(f"Transcription engine switched: {old} → {device_pref}")
+
+        threading.Thread(target=_do_switch, name="DeviceSwitch", daemon=True).start()
+
     def _open_logs(self, icon, item):
         """Open the log directory in Explorer."""
         _LOG_DIR.mkdir(exist_ok=True)
@@ -179,6 +214,29 @@ class VoicemailTrayApp:
         def pause_label(item):
             return "Reprendre" if self.monitor.is_paused else "Mettre en pause"
 
+        npu_label = "NPU (Intel AI Boost)" if self._npu_available else "NPU (non disponible)"
+        device_submenu = pystray.Menu(
+            pystray.MenuItem(
+                "Auto (recommandé)",
+                lambda icon, item: self._switch_device("auto"),
+                checked=lambda item: self._device_pref == "auto",
+                radio=True,
+            ),
+            pystray.MenuItem(
+                npu_label,
+                lambda icon, item: self._switch_device("npu"),
+                checked=lambda item: self._device_pref == "npu",
+                radio=True,
+                enabled=self._npu_available,
+            ),
+            pystray.MenuItem(
+                "CPU (faster-whisper)",
+                lambda icon, item: self._switch_device("cpu"),
+                checked=lambda item: self._device_pref == "cpu",
+                radio=True,
+            ),
+        )
+
         return pystray.Menu(
             pystray.MenuItem(
                 lambda item: f"Transcripteur vocal - {_STATUS_LABELS.get(self._state, self._state)}",
@@ -189,6 +247,7 @@ class VoicemailTrayApp:
             pystray.MenuItem(pause_label, self._toggle_pause),
             pystray.MenuItem("Traiter manuellement (7 jours)", self._manual_scan),
             pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Moteur de transcription", device_submenu),
             pystray.MenuItem("Ouvrir les logs", self._open_logs),
             pystray.MenuItem("Quitter", self._quit),
         )

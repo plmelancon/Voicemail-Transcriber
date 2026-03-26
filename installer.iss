@@ -25,7 +25,7 @@ Name: "french"; MessagesFile: "compiler:Languages\French.isl"
 
 [Files]
 ; Application files (PyInstaller output)
-Source: "dist2\VoicemailTranscriber\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "dist\VoicemailTranscriber\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 ; Whisper model files (bundled for offline use)
 Source: "C:\Users\PLM_Lacoursière\.cache\huggingface\hub\models--mobiuslabsgmbh--faster-whisper-large-v3-turbo\snapshots\0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf\*"; DestDir: "{app}\models\faster-whisper-large-v3-turbo"; Flags: ignoreversion

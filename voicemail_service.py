@@ -3,7 +3,7 @@
 Voicemail Transcriber Service — Main Entry Point
 
 Runs a system tray application that monitors Outlook for incoming voicemails
-and transcribes them automatically using faster-whisper.
+and transcribes them automatically using faster-whisper (CPU) or OpenVINO (NPU).
 
 Usage:
     python voicemail_service.py              # Normal mode (system tray)
@@ -50,7 +50,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 from voicemail_transcriber import CONFIG, OutlookVoicemailProcessor  # noqa: E402
-from resource_manager import WhisperModelManager  # noqa: E402
+from resource_manager import load_settings, create_transcriber  # noqa: E402
 from outlook_monitor import OutlookMonitor  # noqa: E402
 from tray_app import VoicemailTrayApp  # noqa: E402
 
@@ -73,10 +73,12 @@ def main():
     # 1. Build the processor reusing existing CONFIG
     processor = OutlookVoicemailProcessor(CONFIG)
 
-    # 2. Replace the transcriber with our managed faster-whisper version
-    processor.transcriber = WhisperModelManager(
-        model_name=CONFIG["whisper_model"],
-        language=CONFIG["language"],
+    # 2. Load settings and create the appropriate transcriber (NPU/CPU/auto)
+    settings = load_settings()
+    device_pref = settings.get("device", "auto")
+    logger.info(f"Device preference from settings: {device_pref}")
+    processor.transcriber = create_transcriber(
+        device_pref, language=CONFIG["language"]
     )
 
     # 3. Create the tray app and monitor (wired together via callback)
@@ -90,7 +92,7 @@ def main():
         # Normal mode: tray app provides the status callback
         # We create the tray app first but wire the monitor's callback to it
         monitor = OutlookMonitor(processor)
-        tray = VoicemailTrayApp(monitor, processor)
+        tray = VoicemailTrayApp(monitor, processor, device_pref=device_pref)
         monitor.on_status_change = tray.on_status_change
 
     # 4. Catch-up scan in a background thread (process voicemails that
@@ -99,11 +101,11 @@ def main():
         import pythoncom
         pythoncom.CoInitialize()
         try:
-            logger.info("Running catch-up scan (last 24 hours)...")
+            logger.info("Running catch-up scan (last 7 days)...")
             # Reset cached COM connection so this thread gets its own
             processor.outlook = None
             processor.namespace = None
-            results = processor.process_all_voicemails(days_back=1)
+            results = processor.process_all_voicemails(days_back=7)
             logger.info(f"Catch-up scan complete: {results}")
         except Exception as e:
             logger.error(f"Catch-up scan failed: {e}", exc_info=True)
@@ -113,10 +115,34 @@ def main():
     catchup_thread = threading.Thread(target=_catchup, name="CatchupScan", daemon=True)
     catchup_thread.start()
 
-    # 5. Start monitoring for new emails
+    # 5. Periodic polling safety net — catches anything the live monitor misses
+    POLL_INTERVAL_MINUTES = 1
+
+    def _periodic_poll():
+        import pythoncom
+        pythoncom.CoInitialize()
+        try:
+            while True:
+                threading.Event().wait(timeout=POLL_INTERVAL_MINUTES * 60)
+                try:
+                    logger.info("Periodic poll: scanning last 24 hours...")
+                    # Fresh COM connection for this thread
+                    processor.outlook = None
+                    processor.namespace = None
+                    results = processor.process_all_voicemails(days_back=1)
+                    logger.info(f"Periodic poll complete: {results}")
+                except Exception as e:
+                    logger.error(f"Periodic poll failed: {e}", exc_info=True)
+        finally:
+            pythoncom.CoUninitialize()
+
+    poll_thread = threading.Thread(target=_periodic_poll, name="PeriodicPoll", daemon=True)
+    poll_thread.start()
+
+    # 6. Start monitoring for new emails
     monitor.start()
 
-    # 6. Enter the main loop
+    # 7. Enter the main loop
     if args.no_tray:
         logger.info("Running in headless mode. Press Ctrl+C to quit.")
         try:
@@ -130,7 +156,7 @@ def main():
         logger.info("System tray icon active. Right-click to access menu.")
         tray.run()  # blocks until user clicks Quit
 
-    # 7. Cleanup
+    # 8. Cleanup
     if hasattr(processor.transcriber, "force_unload"):
         processor.transcriber.force_unload()
     logger.info("Service stopped")

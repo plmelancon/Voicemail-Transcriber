@@ -44,6 +44,8 @@ class OutlookMonitor:
     RECONNECT_INTERVAL = 30  # seconds between reconnection attempts
     MAX_RECONNECT_FAILURES = 10  # stop retrying after this many consecutive failures
 
+    WATCHDOG_INTERVAL = 60  # seconds between COM thread health checks
+
     def __init__(self, processor, on_status_change=None):
         self.processor = processor
         self.on_status_change = on_status_change or (lambda *a: None)
@@ -52,21 +54,27 @@ class OutlookMonitor:
         self._paused = False
         self._com_thread: threading.Thread | None = None
         self._process_thread: threading.Thread | None = None
+        self._com_restart_count = 0
 
     # -- public API ----------------------------------------------------------
 
     def start(self):
         """Start both the COM listener and processing threads."""
         self._running = True
-        self._com_thread = threading.Thread(
-            target=self._com_event_loop, name="OutlookCOM", daemon=True
-        )
+        self._com_restart_count = 0
+        self._start_com_thread()
         self._process_thread = threading.Thread(
             target=self._processing_loop, name="Transcription", daemon=True
         )
-        self._com_thread.start()
         self._process_thread.start()
         logger.info("Outlook monitor started")
+
+    def _start_com_thread(self):
+        """(Re)start the COM event thread."""
+        self._com_thread = threading.Thread(
+            target=self._com_event_loop, name="OutlookCOM", daemon=True
+        )
+        self._com_thread.start()
 
     def stop(self):
         """Signal both threads to shut down gracefully."""
@@ -120,9 +128,16 @@ class OutlookMonitor:
                 logger.info("Connected to Outlook, listening for new emails")
 
                 # Message pump — keeps COM callbacks alive
+                last_heartbeat = time.monotonic()
                 while self._running:
                     pythoncom.PumpWaitingMessages()
-                    win32api.Sleep(500)
+                    win32api.Sleep(100)
+
+                    # Heartbeat every 5 minutes so logs show the thread is alive
+                    now = time.monotonic()
+                    if now - last_heartbeat >= 300:
+                        logger.info("COM event thread heartbeat — still listening")
+                        last_heartbeat = now
 
             except pythoncom.com_error as e:
                 consecutive_failures += 1
@@ -132,7 +147,10 @@ class OutlookMonitor:
                 self.on_status_change("disconnected", str(e))
 
                 if consecutive_failures >= self.MAX_RECONNECT_FAILURES:
-                    logger.error("Too many reconnection failures, giving up")
+                    logger.error(
+                        "COM thread exiting: %d consecutive reconnection failures",
+                        consecutive_failures,
+                    )
                     self.on_status_change("error", "Impossible de se connecter a Outlook")
                     return
 
@@ -170,24 +188,41 @@ class OutlookMonitor:
         namespace = outlook.GetNamespace("MAPI")
 
         while self._running:
-            item_info = self._queue.get()
+            # Use timeout so we periodically run the watchdog even when idle
+            try:
+                item_info = self._queue.get(timeout=self.WATCHDOG_INTERVAL)
+            except queue.Empty:
+                self._watchdog_check()
+                continue
+
             if item_info is _STOP:
                 break
 
             entry_id, store_id, subject = item_info
 
             try:
-                self.on_status_change("transcribing", subject)
-                logger.info(f"Processing queued voicemail: {subject}")
+                logger.info(f"Processing queued email: {subject}")
 
-                # Re-fetch the mail item on THIS thread's COM apartment
-                mail_item = namespace.GetItemFromID(entry_id, store_id)
-
-                # Double-check it still qualifies (not already processed)
-                if not self.processor.is_voicemail(mail_item):
-                    logger.info(f"Skipping (already processed or no longer voicemail): {subject}")
+                # Re-fetch the mail item on THIS thread's COM apartment.
+                # "Message not found" (0x8004010F) means it was already
+                # processed and its EntryID changed — skip silently.
+                try:
+                    mail_item = namespace.GetItemFromID(entry_id, store_id)
+                except pythoncom.com_error as fetch_err:
+                    logger.info(
+                        f"Skipping '{subject}': item no longer found (already processed?): {fetch_err}"
+                    )
                     self.on_status_change("idle", "")
                     continue
+
+                # Filter here (safe — item is fully delivered by now)
+                if not self.processor.is_voicemail(mail_item):
+                    logger.info(f"Skipping (not a voicemail or already processed): {subject}")
+                    self.on_status_change("idle", "")
+                    continue
+
+                self.on_status_change("transcribing", subject)
+                logger.info(f"Transcribing voicemail: {subject}")
 
                 set_low_priority()
                 success = self.processor.process_single_email(mail_item)
@@ -200,7 +235,7 @@ class OutlookMonitor:
 
             except Exception as e:
                 set_normal_priority()
-                logger.error(f"Error processing voicemail '{subject}': {e}", exc_info=True)
+                logger.error(f"Error processing email '{subject}': {e}", exc_info=True)
                 self.on_status_change("error", str(e))
 
             finally:
@@ -208,6 +243,18 @@ class OutlookMonitor:
                 time.sleep(1)
                 if self._queue.empty():
                     self.on_status_change("idle", "")
+
+    def _watchdog_check(self):
+        """Restart the COM event thread if it has died."""
+        if self._com_thread is not None and not self._com_thread.is_alive():
+            self._com_restart_count += 1
+            logger.warning(
+                "COM thread is dead — restarting (restart #%d)",
+                self._com_restart_count,
+            )
+            self.on_status_change("reconnecting", "Redemarrage du moniteur COM")
+            self._start_com_thread()
+            logger.info("COM thread restarted successfully")
 
 
 # ---------------------------------------------------------------------------
@@ -232,13 +279,15 @@ def _make_items_events_class(monitor: OutlookMonitor):
                 if monitor._paused:
                     return
 
-                if monitor.processor.is_voicemail(item):
-                    entry_id = item.EntryID
-                    store_id = item.Parent.StoreID
-                    subject = item.Subject or "(Sans sujet)"
-                    monitor._queue.put((entry_id, store_id, subject))
-                    monitor.on_status_change("queued", subject)
-                    logger.info(f"Voicemail queued for transcription: {subject}")
+                # Queue immediately — no filtering here to avoid COM
+                # exceptions on partially-delivered items.  The processing
+                # thread will call is_voicemail() after re-fetching.
+                entry_id = item.EntryID
+                store_id = item.Parent.StoreID
+                subject = item.Subject or "(Sans sujet)"
+                monitor._queue.put((entry_id, store_id, subject))
+                monitor.on_status_change("queued", subject)
+                logger.info(f"New email queued for evaluation: {subject}")
             except Exception as e:
                 logger.error(f"Error in OnItemAdd handler: {e}", exc_info=True)
 

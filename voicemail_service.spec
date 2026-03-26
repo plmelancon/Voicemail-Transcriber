@@ -2,6 +2,7 @@
 """
 PyInstaller spec for Voicemail Transcriber Service.
 Build with:  pyinstaller voicemail_service.spec --clean
+Supports both CPU (faster-whisper) and NPU (OpenVINO GenAI) backends.
 """
 
 import os
@@ -15,15 +16,25 @@ av_dir = os.path.dirname(importlib.import_module('av').__file__)
 av_libs = os.path.join(os.path.dirname(av_dir), 'av.libs')
 ort_dir = os.path.dirname(importlib.import_module('onnxruntime').__file__)
 
+# OpenVINO / GenAI directories (NPU backend)
+ov_dir = os.path.dirname(importlib.import_module('openvino').__file__)
+ov_libs = os.path.join(ov_dir, 'libs')
+ov_genai_dir = os.path.dirname(importlib.import_module('openvino_genai').__file__)
+ov_tok_dir = os.path.dirname(importlib.import_module('openvino_tokenizers').__file__)
+ov_tok_libs = os.path.join(ov_tok_dir, 'lib')
+
 a = Analysis(
     ['voicemail_service.py'],
     pathex=[],
     binaries=[
-        # ctranslate2 native DLLs (CUDA support compiled in)
+        # ctranslate2 native DLLs (CPU backend / CUDA support compiled in)
         (os.path.join(ct2_dir, 'ctranslate2.dll'), 'ctranslate2'),
         (os.path.join(ct2_dir, 'cudnn64_9.dll'), 'ctranslate2'),
         (os.path.join(ct2_dir, 'libiomp5md.dll'), 'ctranslate2'),
         (os.path.join(ct2_dir, '_ext.cp311-win_amd64.pyd'), 'ctranslate2'),
+        # OpenVINO GenAI native DLLs (NPU backend)
+        (os.path.join(ov_genai_dir, 'openvino_genai.dll'), 'openvino_genai'),
+        (os.path.join(ov_genai_dir, 'py_openvino_genai.cp311-win_amd64.pyd'), 'openvino_genai'),
     ],
     datas=[
         # ctranslate2 Python package (full directory)
@@ -32,6 +43,14 @@ a = Analysis(
         (av_libs, 'av.libs'),
         # onnxruntime capi (contains onnxruntime.dll etc.)
         (os.path.join(ort_dir, 'capi'), 'onnxruntime/capi'),
+        # OpenVINO core libs (includes NPU plugin, CPU plugin, TBB, etc.)
+        (ov_libs, 'openvino/libs'),
+        # OpenVINO GenAI package
+        (ov_genai_dir, 'openvino_genai'),
+        # OpenVINO Tokenizers native libs (ICU + tokenizer DLL)
+        (ov_tok_libs, 'openvino_tokenizers/lib'),
+        # OpenVINO Tokenizers Python package
+        (ov_tok_dir, 'openvino_tokenizers'),
     ],
     hiddenimports=[
         # pywin32 COM automation
@@ -48,7 +67,7 @@ a = Analysis(
         'win32com.server.util',
         # pystray
         'pystray._win32',
-        # faster-whisper and ctranslate2
+        # faster-whisper and ctranslate2 (CPU backend)
         'faster_whisper',
         'faster_whisper.audio',
         'faster_whisper.feature_extractor',
@@ -64,6 +83,15 @@ a = Analysis(
         'onnxruntime',
         'onnxruntime.capi',
         'onnxruntime.capi._pybind_state',
+        # OpenVINO GenAI (NPU backend)
+        'openvino',
+        'openvino.runtime',
+        'openvino.runtime.opset14',
+        'openvino_genai',
+        'openvino_tokenizers',
+        # Audio loading for NPU backend (soundfile + soxr, NOT librosa)
+        'soundfile',
+        'soxr',
         # huggingface model download
         'huggingface_hub',
         'huggingface_hub.file_download',
@@ -100,11 +128,11 @@ a = Analysis(
         # Other unnecessary packages
         'tkinter',
         '_tkinter',
-        'unittest',
+        # 'unittest',  # needed by scipy → numpy.testing
         'test',
         'xmlrpc',
-        'pydoc',
-        'doctest',
+        # 'pydoc',  # needed by scipy/librosa import chain
+        # 'doctest',  # needed by scipy/librosa import chain
         'flask',
         'flask_cors',
         'uvicorn',
@@ -120,8 +148,8 @@ a = Analysis(
         'python_docx',
         'docx',
         'keyboard',
-        'numba',
-        'llvmlite',
+        'numba',  # large, only needed by librosa (we use soundfile instead)
+        'llvmlite',  # numba dependency
         'tiktoken',
         'waybackpack',
         'pyinstaller',
