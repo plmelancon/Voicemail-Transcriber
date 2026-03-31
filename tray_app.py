@@ -68,9 +68,10 @@ class VoicemailTrayApp:
         self._detail = ""
         self._icon: pystray.Icon | None = None
         self._revert_timer: threading.Timer | None = None
-        # Probe NPU availability once at startup
-        from resource_manager import is_npu_available
+        # Probe hardware availability once at startup
+        from resource_manager import is_npu_available, is_gpu_available
         self._npu_available = is_npu_available()
+        self._gpu_available = is_gpu_available()
 
     # -- Icon image generation -----------------------------------------------
 
@@ -188,7 +189,7 @@ class VoicemailTrayApp:
             language = getattr(self.processor, "config", {}).get("language", "fr")
             self.processor.transcriber = create_transcriber(device_pref, language=language)
 
-            labels = {"auto": "Auto", "npu": "NPU", "cpu": "CPU"}
+            labels = {"auto": "Auto", "npu": "NPU", "gpu": "GPU", "cpu": "CPU"}
             self._show_notification(
                 "Moteur de transcription",
                 f"Changé: {labels.get(old, old)} → {labels.get(device_pref, device_pref)}"
@@ -215,6 +216,7 @@ class VoicemailTrayApp:
             return "Reprendre" if self.monitor.is_paused else "Mettre en pause"
 
         npu_label = "NPU (Intel AI Boost)" if self._npu_available else "NPU (non disponible)"
+        gpu_label = "GPU (CUDA)" if self._gpu_available else "GPU (non disponible)"
         device_submenu = pystray.Menu(
             pystray.MenuItem(
                 "Auto (recommandé)",
@@ -228,6 +230,13 @@ class VoicemailTrayApp:
                 checked=lambda item: self._device_pref == "npu",
                 radio=True,
                 enabled=self._npu_available,
+            ),
+            pystray.MenuItem(
+                gpu_label,
+                lambda icon, item: self._switch_device("gpu"),
+                checked=lambda item: self._device_pref == "gpu",
+                radio=True,
+                enabled=self._gpu_available,
             ),
             pystray.MenuItem(
                 "CPU (faster-whisper)",

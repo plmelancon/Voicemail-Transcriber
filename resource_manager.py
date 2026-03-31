@@ -2,7 +2,8 @@
 """
 Resource Manager for Voicemail Transcriber Service
 Handles process priority and Whisper model lifecycle.
-Supports two backends: faster-whisper (CPU) and OpenVINO GenAI (NPU).
+Supports three backends: faster-whisper on CPU, faster-whisper on CUDA GPU,
+and OpenVINO GenAI on Intel NPU.
 """
 
 import gc
@@ -201,6 +202,102 @@ class WhisperModelManager:
 
 
 # ---------------------------------------------------------------------------
+# GPU Whisper model manager (faster-whisper on CUDA)
+# ---------------------------------------------------------------------------
+
+class GpuWhisperManager:
+    """Whisper transcription backend using faster-whisper on a CUDA GPU.
+
+    Same ``transcribe(audio_path) -> str`` interface as WhisperModelManager.
+
+    Features:
+        - Lazy model loading on first transcription
+        - Automatic unload after IDLE_TIMEOUT seconds of inactivity
+        - VRAM freed on unload via torch.cuda.empty_cache()
+        - Thread-safe (guarded by a Lock)
+    """
+
+    IDLE_TIMEOUT = 300  # 5 minutes
+
+    def __init__(self, model_name: str = "turbo", language: str = "fr"):
+        self.model_name = model_name
+        self.language = language
+        self.device = "cuda"
+        self.compute_type = "float16"
+        self._model = None
+        self._lock = threading.Lock()
+        self._last_used: float = 0
+        self._unload_timer: threading.Timer | None = None
+
+    def transcribe(self, audio_path: str) -> str:
+        """Transcribe an audio file on GPU and return the text."""
+        with self._lock:
+            if self._model is None:
+                logger.info(f"Loading faster-whisper model '{self.model_name}' on {self.device}...")
+                from faster_whisper import WhisperModel
+                model_source = self.model_name
+                if getattr(_sys, 'frozen', False):
+                    bundled = Path(_sys.executable).parent / "models" / "faster-whisper-large-v3-turbo"
+                    if bundled.exists():
+                        model_source = str(bundled)
+                        logger.info(f"Using bundled model at {model_source}")
+                self._model = WhisperModel(
+                    model_source,
+                    device=self.device,
+                    compute_type=self.compute_type,
+                )
+                logger.info("Model loaded successfully on GPU")
+            self._last_used = time.time()
+            self._reset_unload_timer()
+
+            logger.info(f"Transcribing: {audio_path}")
+            try:
+                segments, _info = self._model.transcribe(
+                    audio_path,
+                    language=self.language,
+                    task="transcribe",
+                )
+                text = " ".join(seg.text.strip() for seg in segments).strip()
+                logger.info(f"Transcription complete: {len(text)} characters")
+                return text
+            except Exception as e:
+                logger.error(f"Transcription error: {e}")
+                raise
+
+    def force_unload(self):
+        """Immediately unload the model and free VRAM."""
+        with self._lock:
+            self._cancel_timer()
+            self._do_unload()
+
+    # -- internal ------------------------------------------------------------
+
+    def _reset_unload_timer(self):
+        self._cancel_timer()
+        self._unload_timer = threading.Timer(self.IDLE_TIMEOUT, self._unload_if_idle)
+        self._unload_timer.daemon = True
+        self._unload_timer.start()
+
+    def _cancel_timer(self):
+        if self._unload_timer is not None:
+            self._unload_timer.cancel()
+            self._unload_timer = None
+
+    def _unload_if_idle(self):
+        with self._lock:
+            if self._model is not None and (time.time() - self._last_used >= self.IDLE_TIMEOUT):
+                self._do_unload()
+
+    def _do_unload(self):
+        if self._model is not None:
+            logger.info("Unloading Whisper GPU model (idle timeout)...")
+            del self._model
+            self._model = None
+            gc.collect()
+            logger.info("GPU model unloaded, VRAM freed")
+
+
+# ---------------------------------------------------------------------------
 # NPU Whisper model manager (OpenVINO GenAI)
 # ---------------------------------------------------------------------------
 
@@ -375,34 +472,146 @@ def is_npu_available() -> bool:
         return False
 
 
+def is_gpu_available() -> bool:
+    """Check if a CUDA-capable GPU is available via ctranslate2."""
+    try:
+        import ctranslate2
+        return ctranslate2.get_cuda_device_count() > 0
+    except Exception:
+        return False
+
+
+class AutoFallbackTranscriber:
+    """Tries backends in priority order: NPU → GPU → CPU.
+
+    Each backend is attempted at inference time.  If a fatal device error is
+    detected (e.g. ZE_RESULT_ERROR_DEVICE_LOST for NPU, CUDA OOM/device
+    errors for GPU), the failing backend is unloaded and the next one in the
+    chain is created lazily and retried.
+    """
+
+    _NPU_FATAL_KEYWORDS = ("DEVICE_LOST", "DEVICE_HUNG", "device hung")
+    _GPU_FATAL_KEYWORDS = (
+        "CUDA", "cuda", "out of memory", "device-side assert",
+        "CUBLAS", "CUDNN", "NCCL",
+    )
+
+    def __init__(
+        self,
+        npu: "NpuWhisperManager | None",
+        gpu_available: bool = False,
+        language: str = "fr",
+    ):
+        self._language = language
+        self._gpu_available = gpu_available
+        # The ordered list of backends to try. Entries are removed as they fail.
+        self._backends: list[tuple[str, object | None]] = []
+        if npu is not None:
+            self._backends.append(("npu", npu))
+        if gpu_available:
+            self._backends.append(("gpu", None))   # created lazily
+        self._backends.append(("cpu", None))        # created lazily
+
+    def _get_or_create(self, name: str, instance: object | None):
+        """Return existing instance or create one on demand."""
+        if instance is not None:
+            return instance
+        if name == "gpu":
+            return GpuWhisperManager(language=self._language)
+        if name == "cpu":
+            return WhisperModelManager(language=self._language)
+        raise RuntimeError(f"Unknown backend: {name}")
+
+    def transcribe(self, audio_path: str) -> str:
+        last_exc: Exception | None = None
+
+        for idx, (name, instance) in enumerate(list(self._backends)):
+            backend = self._get_or_create(name, instance)
+            # Persist the created instance back so we don't recreate it
+            self._backends[idx] = (name, backend)
+            try:
+                return backend.transcribe(audio_path)
+            except Exception as exc:
+                exc_str = str(exc)
+                is_fatal = (
+                    (name == "npu" and any(k in exc_str for k in self._NPU_FATAL_KEYWORDS))
+                    or (name == "gpu" and any(k in exc_str for k in self._GPU_FATAL_KEYWORDS))
+                )
+                if is_fatal and idx < len(self._backends) - 1:
+                    next_name = self._backends[idx + 1][0]
+                    logger.warning(
+                        "%s device error, falling back to %s: %s",
+                        name.upper(), next_name.upper(), exc,
+                    )
+                    backend.force_unload()
+                    # Remove the failed backend from the chain
+                    self._backends.pop(idx)
+                    # Retry with the rest of the chain (recursive-safe via loop)
+                    return self.transcribe(audio_path)
+                last_exc = exc
+
+        # All backends exhausted — re-raise the last error
+        raise last_exc  # type: ignore[misc]
+
+    def force_unload(self):
+        for _name, instance in self._backends:
+            if instance is not None and hasattr(instance, "force_unload"):
+                instance.force_unload()
+
+    @property
+    def active_backend(self) -> str:
+        """Return the name of the first (highest-priority) backend still in the chain."""
+        return self._backends[0][0] if self._backends else "none"
+
+
 def create_transcriber(device_pref: str = "auto", language: str = "fr"):
     """Create the appropriate transcriber backend.
 
     Parameters
     ----------
     device_pref : str
-        ``"auto"`` — try NPU, fall back to CPU.
+        ``"auto"`` — try NPU → GPU → CPU, with runtime fallback on errors.
         ``"npu"``  — force OpenVINO NPU.
+        ``"gpu"``  — force faster-whisper on CUDA GPU.
         ``"cpu"``  — force faster-whisper on CPU.
     language : str
         Language code for transcription (default: ``"fr"``).
 
     Returns
     -------
-    WhisperModelManager or NpuWhisperManager
+    WhisperModelManager, GpuWhisperManager, NpuWhisperManager, or AutoFallbackTranscriber
     """
     if device_pref == "npu":
         logger.info("Device preference: NPU (forced)")
         return NpuWhisperManager(language=language)
 
+    if device_pref == "gpu":
+        logger.info("Device preference: GPU (forced)")
+        return GpuWhisperManager(language=language)
+
     if device_pref == "cpu":
         logger.info("Device preference: CPU (forced)")
         return WhisperModelManager(language=language)
 
-    # auto: try NPU first
-    if is_npu_available() and NpuWhisperManager.MODEL_DIR.exists():
-        logger.info("Device preference: auto → NPU available, using NPU")
-        return NpuWhisperManager(language=language)
-    else:
-        logger.info("Device preference: auto → NPU not available, falling back to CPU")
+    # auto: build the NPU → GPU → CPU fallback chain
+    npu_ok = is_npu_available() and NpuWhisperManager.MODEL_DIR.exists()
+    gpu_ok = is_gpu_available()
+
+    npu = NpuWhisperManager(language=language) if npu_ok else None
+    chain_parts = []
+    if npu_ok:
+        chain_parts.append("NPU")
+    if gpu_ok:
+        chain_parts.append("GPU")
+    chain_parts.append("CPU")
+    logger.info("Device preference: auto → chain: %s", " → ".join(chain_parts))
+
+    # If only CPU is available, skip the wrapper overhead
+    if not npu_ok and not gpu_ok:
         return WhisperModelManager(language=language)
+
+    return AutoFallbackTranscriber(
+        npu=npu,
+        gpu_available=gpu_ok,
+        language=language,
+    )
