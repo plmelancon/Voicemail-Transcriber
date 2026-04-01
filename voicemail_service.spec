@@ -2,7 +2,7 @@
 """
 PyInstaller spec for Voicemail Transcriber Service.
 Build with:  pyinstaller voicemail_service.spec --clean
-Supports both CPU (faster-whisper) and NPU (OpenVINO GenAI) backends.
+Supports CPU, CUDA GPU, and Intel NPU backends.
 """
 
 import os
@@ -15,6 +15,9 @@ ct2_dir = os.path.dirname(importlib.import_module('ctranslate2').__file__)
 av_dir = os.path.dirname(importlib.import_module('av').__file__)
 av_libs = os.path.join(os.path.dirname(av_dir), 'av.libs')
 ort_dir = os.path.dirname(importlib.import_module('onnxruntime').__file__)
+
+# CUDA runtime DLLs from torch (needed by ctranslate2 for GPU inference)
+torch_lib = os.path.join(os.path.dirname(importlib.import_module('torch').__file__), 'lib')
 
 # OpenVINO / GenAI directories (NPU backend)
 ov_dir = os.path.dirname(importlib.import_module('openvino').__file__)
@@ -32,6 +35,11 @@ a = Analysis(
         (os.path.join(ct2_dir, 'cudnn64_9.dll'), 'ctranslate2'),
         (os.path.join(ct2_dir, 'libiomp5md.dll'), 'ctranslate2'),
         (os.path.join(ct2_dir, '_ext.cp311-win_amd64.pyd'), 'ctranslate2'),
+        # CUDA runtime DLLs (from torch/lib — required by ctranslate2 for GPU inference)
+        (os.path.join(torch_lib, 'cublas64_12.dll'), '.'),
+        (os.path.join(torch_lib, 'cublasLt64_12.dll'), '.'),
+        (os.path.join(torch_lib, 'cudart64_12.dll'), '.'),
+        (os.path.join(torch_lib, 'cufft64_11.dll'), '.'),
         # OpenVINO GenAI native DLLs (NPU backend)
         (os.path.join(ov_genai_dir, 'openvino_genai.dll'), 'openvino_genai'),
         (os.path.join(ov_genai_dir, 'py_openvino_genai.cp311-win_amd64.pyd'), 'openvino_genai'),
