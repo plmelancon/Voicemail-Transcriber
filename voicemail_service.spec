@@ -16,8 +16,20 @@ av_dir = os.path.dirname(importlib.import_module('av').__file__)
 av_libs = os.path.join(os.path.dirname(av_dir), 'av.libs')
 ort_dir = os.path.dirname(importlib.import_module('onnxruntime').__file__)
 
-# CUDA runtime DLLs from torch (needed by ctranslate2 for GPU inference)
-torch_lib = os.path.join(os.path.dirname(importlib.import_module('torch').__file__), 'lib')
+# CUDA runtime DLLs (needed by ctranslate2 for GPU inference).
+# We copy them to a temp dir so PyInstaller never sees a path containing
+# "torch" — otherwise it creates a partial torch/ package in the bundle
+# which shadows the excluded torch and breaks ctranslate2 imports.
+import shutil, tempfile
+_torch_lib = os.path.join(os.path.dirname(importlib.import_module('torch').__file__), 'lib')
+_cuda_tmp = tempfile.mkdtemp(prefix='cuda_dlls_')
+CUDA_DLLS = {}
+for _name in ['cublas64_12.dll', 'cublasLt64_12.dll', 'cudart64_12.dll']:
+    _src = os.path.join(_torch_lib, _name)
+    _dst = os.path.join(_cuda_tmp, _name)
+    shutil.copy2(_src, _dst)
+    CUDA_DLLS[_name] = _dst
+del _torch_lib, _src, _dst, _name
 
 # OpenVINO / GenAI directories (NPU backend)
 ov_dir = os.path.dirname(importlib.import_module('openvino').__file__)
@@ -35,10 +47,10 @@ a = Analysis(
         (os.path.join(ct2_dir, 'cudnn64_9.dll'), 'ctranslate2'),
         (os.path.join(ct2_dir, 'libiomp5md.dll'), 'ctranslate2'),
         (os.path.join(ct2_dir, '_ext.cp311-win_amd64.pyd'), 'ctranslate2'),
-        # CUDA runtime DLLs (from torch/lib — required by ctranslate2 for GPU inference)
-        (os.path.join(torch_lib, 'cublas64_12.dll'), '.'),
-        (os.path.join(torch_lib, 'cublasLt64_12.dll'), '.'),
-        (os.path.join(torch_lib, 'cudart64_12.dll'), '.'),
+        # CUDA runtime DLLs (required by ctranslate2 for GPU inference)
+        (CUDA_DLLS['cublas64_12.dll'], '.'),
+        (CUDA_DLLS['cublasLt64_12.dll'], '.'),
+        (CUDA_DLLS['cudart64_12.dll'], '.'),
         # OpenVINO GenAI native DLLs (NPU backend)
         (os.path.join(ov_genai_dir, 'openvino_genai.dll'), 'openvino_genai'),
         (os.path.join(ov_genai_dir, 'py_openvino_genai.cp311-win_amd64.pyd'), 'openvino_genai'),
