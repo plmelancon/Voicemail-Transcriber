@@ -495,6 +495,12 @@ class AutoFallbackTranscriber:
         "CUDA", "cuda", "out of memory", "device-side assert",
         "CUBLAS", "CUDNN", "NCCL",
     )
+    # Modules that OpenVINO's NPU plugin injects as partial stubs into
+    # sys.modules. After an NPU failure these stubs linger and break any
+    # later faster-whisper / ctranslate2 import in the same process
+    # (symptom: "module 'torch' has no attribute 'Tensor'"). Purging them
+    # lets the next backend re-import cleanly.
+    _POISONED_MODULES = ("torch", "torchvision", "torchaudio")
 
     def __init__(
         self,
@@ -522,11 +528,38 @@ class AutoFallbackTranscriber:
             return WhisperModelManager(language=self._language)
         raise RuntimeError(f"Unknown backend: {name}")
 
+    def _purge_poisoned_modules(self):
+        """Remove partial torch stubs from sys.modules so the next backend
+        can re-import cleanly. See comment on _POISONED_MODULES above.
+        """
+        import sys
+        purged = []
+        for mod in list(sys.modules):
+            if mod in self._POISONED_MODULES or any(
+                mod.startswith(p + ".") for p in self._POISONED_MODULES
+            ):
+                sys.modules.pop(mod, None)
+                purged.append(mod)
+        if purged:
+            logger.info("Purged %d poisoned module(s) from sys.modules", len(purged))
+
     def transcribe(self, audio_path: str) -> str:
         last_exc: Exception | None = None
 
         for idx, (name, instance) in enumerate(list(self._backends)):
-            backend = self._get_or_create(name, instance)
+            try:
+                backend = self._get_or_create(name, instance)
+            except Exception as exc:
+                # Backend construction itself failed (e.g. poisoned torch
+                # module breaking WhisperModel init). Treat as fatal for
+                # this backend and move on.
+                logger.warning(
+                    "%s backend creation failed, skipping: %s", name.upper(), exc,
+                )
+                self._backends.pop(idx)
+                self._purge_poisoned_modules()
+                return self.transcribe(audio_path)
+
             # Persist the created instance back so we don't recreate it
             self._backends[idx] = (name, backend)
             try:
@@ -543,9 +576,19 @@ class AutoFallbackTranscriber:
                         "%s device error, falling back to %s: %s",
                         name.upper(), next_name.upper(), exc,
                     )
-                    backend.force_unload()
+                    try:
+                        backend.force_unload()
+                    except Exception as unload_exc:
+                        logger.warning(
+                            "%s force_unload failed (ignored): %s",
+                            name.upper(), unload_exc,
+                        )
                     # Remove the failed backend from the chain
                     self._backends.pop(idx)
+                    # NPU failure can leave stub torch modules in sys.modules
+                    # that break the next backend's init — purge them.
+                    if name == "npu":
+                        self._purge_poisoned_modules()
                     # Retry with the rest of the chain (recursive-safe via loop)
                     return self.transcribe(audio_path)
                 last_exc = exc

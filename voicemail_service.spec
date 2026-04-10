@@ -44,7 +44,7 @@ a = Analysis(
     binaries=[
         # ctranslate2 native DLLs (CPU backend / CUDA support compiled in)
         (os.path.join(ct2_dir, 'ctranslate2.dll'), 'ctranslate2'),
-        (os.path.join(ct2_dir, 'cudnn64_9.dll'), 'ctranslate2'),
+        (os.path.join(ct2_dir, 'cudnn64_8.dll'), 'ctranslate2'),
         (os.path.join(ct2_dir, 'libiomp5md.dll'), 'ctranslate2'),
         (os.path.join(ct2_dir, '_ext.cp311-win_amd64.pyd'), 'ctranslate2'),
         # CUDA runtime DLLs (required by ctranslate2 for GPU inference)

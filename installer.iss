@@ -1,15 +1,17 @@
 ; Inno Setup Script for Voicemail Transcriber
 ; Build with: "C:\Users\PLM_Lacoursière\AppData\Local\Programs\Inno Setup 6\ISCC.exe" installer.iss
 
+#define MyAppVersion "0.0.4"
+
 [Setup]
 AppName=Transcripteur Vocal
-AppVersion=1.0
+AppVersion={#MyAppVersion}
 AppPublisher=Pierre-Luc Melancon
 AppId={{B7E3D4A1-9F2C-4E8B-A5D6-1C3F7E9B2D4A}
 DefaultDirName={autopf}\VoicemailTranscriber
 DefaultGroupName=Transcripteur Vocal
 OutputDir=installer_output
-OutputBaseFilename=VoicemailTranscriber_Setup
+OutputBaseFilename=VoicemailTranscriber_Setup_{#MyAppVersion}
 Compression=lzma2/ultra64
 SolidCompression=yes
 SetupIconFile=app_icon.ico
