@@ -225,8 +225,10 @@ class OutlookMonitor:
                 logger.info(f"Transcribing voicemail: {subject}")
 
                 set_low_priority()
-                success = self.processor.process_single_email(mail_item)
-                set_normal_priority()
+                try:
+                    success = self.processor.process_single_email(mail_item)
+                finally:
+                    set_normal_priority()
 
                 if success:
                     self.on_status_change("done", subject)
@@ -235,6 +237,15 @@ class OutlookMonitor:
 
             except Exception as e:
                 set_normal_priority()
+                # BackoffPendingError is a normal retry-scheduling signal, not a failure.
+                try:
+                    from subprocess_transcriber import BackoffPendingError  # noqa: E402
+                except ImportError:
+                    BackoffPendingError = None  # type: ignore[assignment]
+                if BackoffPendingError is not None and isinstance(e, BackoffPendingError):
+                    logger.info(f"Deferred (backoff) '{subject}': {e}")
+                    self.on_status_change("idle", "")
+                    continue
                 logger.error(f"Error processing email '{subject}': {e}", exc_info=True)
                 self.on_status_change("error", str(e))
 

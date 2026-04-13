@@ -19,6 +19,33 @@ from datetime import datetime
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
+# CRITICAL: Subprocess modes need stdio
+# ---------------------------------------------------------------------------
+# PyInstaller's windowed (--noconsole) builds set sys.stdout and sys.stderr
+# to None unconditionally, even when the parent process piped them via
+# subprocess.Popen(stdout=PIPE). But the underlying OS file descriptors
+# (fd 0/1/2) are still valid and point at the pipes. For --worker and
+# --probe-devices modes we NEED stdio to work, so reopen fd 0/1/2 as Python
+# file objects. This must happen before logging.basicConfig touches stdout.
+_NEEDS_STDIO = any(a in sys.argv for a in ("--worker", "--probe-devices"))
+if _NEEDS_STDIO:
+    if sys.stdout is None:
+        try:
+            sys.stdout = os.fdopen(1, "w", buffering=1, encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    if sys.stderr is None:
+        try:
+            sys.stderr = os.fdopen(2, "w", buffering=1, encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    if sys.stdin is None:
+        try:
+            sys.stdin = os.fdopen(0, "r", encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+# ---------------------------------------------------------------------------
 # Logging setup (must happen before any other import that uses logging)
 # ---------------------------------------------------------------------------
 
@@ -32,14 +59,36 @@ APP_DIR = _get_app_dir()
 # Logs go to %LOCALAPPDATA% (writable even when app is in Program Files)
 LOG_DIR = Path(os.environ.get('LOCALAPPDATA', str(APP_DIR))) / "VoicemailTranscriber" / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
-LOG_FILE = LOG_DIR / f"voicemail_service_{datetime.now().strftime('%Y-%m')}.log"
 
-_handlers = [logging.FileHandler(LOG_FILE, encoding="utf-8")]
-if sys.stdout is not None:
-    _handlers.append(logging.StreamHandler(sys.stdout))
+# Pick a log filename based on how this process was invoked. Subprocess
+# modes (--worker, --probe-devices) must NOT write to the same file as the
+# long-running service, because Python's FileHandler has no cross-process
+# locking and concurrent writes would interleave. Detect mode from argv
+# here, before logging.basicConfig is called.
+_is_worker = "--worker" in sys.argv
+_is_probe = "--probe-devices" in sys.argv
+
+if _is_probe:
+    # Probe is short-lived and we need stdout to carry a clean JSON line.
+    # Keep logging quiet and out of the log directory entirely.
+    _handlers = [logging.StreamHandler(sys.stderr)] if sys.stderr is not None else []
+    _log_level = logging.WARNING
+elif _is_worker:
+    _log_file = LOG_DIR / f"voicemail_worker_{datetime.now().strftime('%Y-%m')}.log"
+    _handlers = [logging.FileHandler(_log_file, encoding="utf-8")]
+    # Do NOT add a StreamHandler on stdout — stdout is the IPC channel.
+    if sys.stderr is not None:
+        _handlers.append(logging.StreamHandler(sys.stderr))
+    _log_level = logging.INFO
+else:
+    LOG_FILE = LOG_DIR / f"voicemail_service_{datetime.now().strftime('%Y-%m')}.log"
+    _handlers = [logging.FileHandler(LOG_FILE, encoding="utf-8")]
+    if sys.stdout is not None:
+        _handlers.append(logging.StreamHandler(sys.stdout))
+    _log_level = logging.INFO
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=_log_level,
     format="%(asctime)s - %(levelname)s - [%(threadName)s] %(message)s",
     handlers=_handlers,
 )
@@ -50,9 +99,96 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 from voicemail_transcriber import CONFIG, OutlookVoicemailProcessor  # noqa: E402
-from resource_manager import load_settings, create_transcriber  # noqa: E402
+
+
+def _run_worker_mode(device: str, language: str) -> int:
+    """Long-lived transcription worker. Reads JSON requests from stdin,
+    writes JSON responses to stdout, one per line.
+
+    Protocol:
+        request  : {"id": str, "cmd": "transcribe", "audio_path": str}
+                 | {"id": str, "cmd": "shutdown"}
+        response : {"id": str, "ok": true,  "text": str}
+                 | {"id": str, "ok": false, "error": str}
+
+    Exits 0 on clean shutdown, non-zero on fatal error. Native crashes
+    (cuDNN etc.) propagate as the process exit code, which the parent
+    SubprocessTranscriber detects and treats as "this backend is dead".
+    """
+    import json
+    from resource_manager import create_transcriber  # noqa: E402
+
+    logger.info(f"[Worker] Starting worker mode on device={device}")
+    try:
+        transcriber = create_transcriber(device, language=language)
+    except Exception as exc:
+        logger.error(f"[Worker] Failed to create transcriber: {exc}", exc_info=True)
+        sys.stdout.write(json.dumps({"id": "", "ok": False, "error": f"init_failed: {exc}"}) + "\n")
+        sys.stdout.flush()
+        return 2
+
+    sys.stdout.write(json.dumps({"id": "", "ok": True, "ready": True}) + "\n")
+    sys.stdout.flush()
+    logger.info("[Worker] Ready")
+
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            req = json.loads(line)
+        except json.JSONDecodeError as exc:
+            sys.stdout.write(json.dumps({"id": "", "ok": False, "error": f"bad_json: {exc}"}) + "\n")
+            sys.stdout.flush()
+            continue
+
+        req_id = req.get("id", "")
+        cmd = req.get("cmd")
+
+        if cmd == "shutdown":
+            logger.info("[Worker] Shutdown requested")
+            sys.stdout.write(json.dumps({"id": req_id, "ok": True, "bye": True}) + "\n")
+            sys.stdout.flush()
+            try:
+                if hasattr(transcriber, "force_unload"):
+                    transcriber.force_unload()
+            except Exception:
+                pass
+            return 0
+
+        if cmd == "transcribe":
+            audio_path = req.get("audio_path", "")
+            try:
+                text = transcriber.transcribe(audio_path)
+                sys.stdout.write(json.dumps({"id": req_id, "ok": True, "text": text}) + "\n")
+                sys.stdout.flush()
+            except Exception as exc:
+                logger.error(f"[Worker] Transcription error: {exc}", exc_info=True)
+                sys.stdout.write(json.dumps({"id": req_id, "ok": False, "error": str(exc)}) + "\n")
+                sys.stdout.flush()
+            continue
+
+        sys.stdout.write(json.dumps({"id": req_id, "ok": False, "error": f"unknown_cmd: {cmd}"}) + "\n")
+        sys.stdout.flush()
+
+    logger.info("[Worker] stdin closed, exiting")
+    return 0
+
+
+def _run_probe_devices() -> int:
+    """One-shot device availability probe. Prints JSON to stdout and exits."""
+    import json
+    from resource_manager import is_npu_available, is_gpu_available  # noqa: E402
+    result = {"npu": bool(is_npu_available()), "gpu": bool(is_gpu_available())}
+    sys.stdout.write(json.dumps(result) + "\n")
+    sys.stdout.flush()
+    return 0
+
+
+from resource_manager import load_settings  # noqa: E402
 from outlook_monitor import OutlookMonitor  # noqa: E402
 from tray_app import VoicemailTrayApp  # noqa: E402
+from subprocess_transcriber import SubprocessTranscriber  # noqa: E402
 
 
 def main():
@@ -64,7 +200,30 @@ def main():
         action="store_true",
         help="Mode sans icone de barre des taches (console uniquement)",
     )
+    parser.add_argument(
+        "--worker",
+        action="store_true",
+        help="Run as a transcription worker subprocess (internal use)",
+    )
+    parser.add_argument(
+        "--probe-devices",
+        action="store_true",
+        help="Print NPU/GPU availability as JSON and exit (internal use)",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        choices=["auto", "npu", "gpu", "cpu"],
+        help="Device for --worker mode",
+    )
     args = parser.parse_args()
+
+    # Subprocess modes dispatch before any tray/monitor setup
+    if args.probe_devices:
+        sys.exit(_run_probe_devices())
+    if args.worker:
+        sys.exit(_run_worker_mode(args.device, CONFIG["language"]))
 
     logger.info("=" * 60)
     logger.info("  Voicemail Transcriber Service starting")
@@ -73,12 +232,15 @@ def main():
     # 1. Build the processor reusing existing CONFIG
     processor = OutlookVoicemailProcessor(CONFIG)
 
-    # 2. Load settings and create the appropriate transcriber (NPU/CPU/auto)
+    # 2. Load settings and attach a subprocess-isolated transcriber.
+    #    Inference runs in a long-lived child process so native crashes
+    #    (e.g. cuDNN access violations) cannot kill the service.
     settings = load_settings()
     device_pref = settings.get("device", "auto")
     logger.info(f"Device preference from settings: {device_pref}")
-    processor.transcriber = create_transcriber(
-        device_pref, language=CONFIG["language"]
+    processor.transcriber = SubprocessTranscriber(
+        device_pref=device_pref,
+        language=CONFIG["language"],
     )
 
     # 3. Create the tray app and monitor (wired together via callback)

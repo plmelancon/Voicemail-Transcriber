@@ -193,7 +193,9 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
-    console=False,  # System tray app — no console window
+    console=True,   # Console=True so stdio works for --worker subprocess IPC.
+                    # The supervisor launches us with CREATE_NO_WINDOW so the
+                    # user never actually sees a console window.
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,

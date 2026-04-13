@@ -24,20 +24,12 @@ def _get_app_dir():
         return Path(sys.executable).parent
     return Path(__file__).parent
 
-# Configuration du logging — logs go to %LOCALAPPDATA% (writable even when app is in Program Files)
-LOG_DIR = Path(os.environ.get('LOCALAPPDATA', str(_get_app_dir()))) / "VoicemailTranscriber" / "logs"
-LOG_DIR.mkdir(parents=True, exist_ok=True)
-LOG_FILE = LOG_DIR / f"voicemail_transcriber_{datetime.now().strftime('%Y-%m')}.log"
-
-_handlers = [logging.FileHandler(LOG_FILE, encoding='utf-8')]
-if sys.stdout is not None:
-    _handlers.append(logging.StreamHandler(sys.stdout))
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=_handlers,
-)
+# This module is loaded by voicemail_service.py which already configures the
+# root logger (file + stream handlers). Don't add a second FileHandler here —
+# previous versions did, which produced empty voicemail_transcriber_YYYY-MM.log
+# files in %LOCALAPPDATA%\VoicemailTranscriber\logs\ that confused debugging.
+# Just grab a named logger; messages will flow through whatever handlers the
+# caller has installed.
 logger = logging.getLogger(__name__)
 
 # ============================================================================
@@ -213,22 +205,34 @@ class OutlookVoicemailProcessor:
         """Traite un seul courriel de messagerie vocale"""
         subject = mail_item.Subject or "(Sans sujet)"
         logger.info(f"Traitement: {subject}")
-        
+
+        # EntryID is used by SubprocessTranscriber for per-voicemail retry
+        # bookkeeping. Safe to read up-front; the item is already delivered.
+        try:
+            entry_id = mail_item.EntryID or ""
+        except Exception:
+            entry_id = ""
+
         audio_path, audio_filename = self.extract_audio_attachment(mail_item)
         if not audio_path:
             logger.warning(f"Aucune piece jointe audio trouvee dans: {subject}")
             return False
-        
+
         try:
-            transcription = self.transcriber.transcribe(audio_path)
-            
+            # Pass entry_id if the transcriber accepts it (SubprocessTranscriber).
+            # Older in-process transcribers ignore the kwarg.
+            try:
+                transcription = self.transcriber.transcribe(audio_path, entry_id=entry_id)
+            except TypeError:
+                transcription = self.transcriber.transcribe(audio_path)
+
             if transcription:
                 success = self.add_transcription_to_email(mail_item, transcription, audio_filename)
                 return success
             else:
                 logger.warning("Transcription vide")
                 return False
-                
+
         finally:
             try:
                 if audio_path and os.path.exists(audio_path):
@@ -278,13 +282,19 @@ class OutlookVoicemailProcessor:
     def process_all_voicemails(self, days_back: int = None) -> dict:
         """Traite tous les messages vocaux non traites"""
         results = {"processed": 0, "failed": 0, "skipped": 0}
-        
+
         voicemails = self.find_voicemails(days_back)
-        
+
         if not voicemails:
             logger.info("Aucun message vocal a traiter")
             return results
-        
+
+        # Import lazily so this module still works without subprocess_transcriber
+        try:
+            from subprocess_transcriber import BackoffPendingError  # noqa: E402
+        except ImportError:
+            BackoffPendingError = None  # type: ignore[assignment]
+
         for mail in voicemails:
             try:
                 success = self.process_single_email(mail)
@@ -293,9 +303,14 @@ class OutlookVoicemailProcessor:
                 else:
                     results["failed"] += 1
             except Exception as e:
+                if BackoffPendingError is not None and isinstance(e, BackoffPendingError):
+                    # Retry window not yet elapsed — skip this poll, try next one.
+                    logger.info(f"Skipped (backoff): {mail.Subject or '(Sans sujet)'}")
+                    results["skipped"] += 1
+                    continue
                 logger.error(f"Erreur lors du traitement: {e}")
                 results["failed"] += 1
-        
+
         logger.info(f"Traitement termine: {results}")
         return results
 

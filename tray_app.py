@@ -68,10 +68,47 @@ class VoicemailTrayApp:
         self._detail = ""
         self._icon: pystray.Icon | None = None
         self._revert_timer: threading.Timer | None = None
-        # Probe hardware availability once at startup
-        from resource_manager import is_npu_available, is_gpu_available
-        self._npu_available = is_npu_available()
-        self._gpu_available = is_gpu_available()
+        # Probe hardware availability via a one-shot subprocess so the service
+        # process never imports OpenVINO/ctranslate2. This keeps the long-
+        # lived service free of ML libraries that could destabilize it.
+        self._npu_available, self._gpu_available = self._probe_devices_subprocess()
+
+    @staticmethod
+    def _probe_devices_subprocess() -> tuple[bool, bool]:
+        """Run `VoicemailTranscriber.exe --probe-devices` and parse the JSON.
+        Returns (npu_available, gpu_available). Falls back to (False, False)
+        on any error so the menu still renders."""
+        import json
+        import subprocess
+        try:
+            if getattr(_sys, "frozen", False):
+                cmd = [_sys.executable, "--probe-devices", "--no-tray"]
+            else:
+                script = Path(__file__).parent / "voicemail_service.py"
+                cmd = [_sys.executable, str(script), "--probe-devices", "--no-tray"]
+            creationflags = 0
+            if _sys.platform == "win32":
+                creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=60,
+                creationflags=creationflags,
+            )
+            # The probe prints a single JSON line; there may be log output
+            # above it from logging.basicConfig, so scan for the last JSON line.
+            for line in reversed(result.stdout.splitlines()):
+                line = line.strip()
+                if line.startswith("{") and line.endswith("}"):
+                    data = json.loads(line)
+                    return bool(data.get("npu")), bool(data.get("gpu"))
+            logger.warning("Device probe returned no JSON; assuming nothing available")
+        except Exception as exc:
+            logger.warning(f"Device probe failed: {exc}")
+        return False, False
 
     # -- Icon image generation -----------------------------------------------
 
@@ -170,29 +207,44 @@ class VoicemailTrayApp:
         threading.Thread(target=_scan, name="ManualScan", daemon=True).start()
 
     def _switch_device(self, device_pref: str):
-        """Switch the transcription backend (auto/npu/cpu)."""
+        """Switch the transcription backend (auto/npu/gpu/cpu).
+
+        Asks the current SubprocessTranscriber to change its preferred
+        device. The next transcription will spawn a fresh worker on the
+        new device; no ML libraries load in the service process itself.
+        """
         def _do_switch():
-            from resource_manager import save_settings, create_transcriber
+            from resource_manager import save_settings
             old = self._device_pref
             if device_pref == old:
                 return
             self._device_pref = device_pref
             save_settings({"device": device_pref})
 
-            # Unload old transcriber
+            transcriber = self.processor.transcriber
             try:
-                self.processor.transcriber.force_unload()
-            except Exception:
-                pass
-
-            # Create new one
-            language = getattr(self.processor, "config", {}).get("language", "fr")
-            self.processor.transcriber = create_transcriber(device_pref, language=language)
+                if hasattr(transcriber, "switch_device"):
+                    transcriber.switch_device(device_pref)
+                else:
+                    # Fallback for older in-process transcribers (dev only)
+                    try:
+                        transcriber.force_unload()
+                    except Exception:
+                        pass
+                    from resource_manager import create_transcriber
+                    language = getattr(self.processor, "config", {}).get("language", "fr")
+                    self.processor.transcriber = create_transcriber(
+                        device_pref, language=language
+                    )
+            except Exception as exc:
+                logger.error(f"Device switch failed: {exc}", exc_info=True)
+                self._show_notification("Erreur", f"Changement de moteur échoué: {exc}")
+                return
 
             labels = {"auto": "Auto", "npu": "NPU", "gpu": "GPU", "cpu": "CPU"}
             self._show_notification(
                 "Moteur de transcription",
-                f"Changé: {labels.get(old, old)} → {labels.get(device_pref, device_pref)}"
+                f"Changé: {labels.get(old, old)} → {labels.get(device_pref, device_pref)}",
             )
             logger.info(f"Transcription engine switched: {old} → {device_pref}")
 
