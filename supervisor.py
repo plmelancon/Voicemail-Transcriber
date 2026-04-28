@@ -14,6 +14,15 @@ Backoff ladder for rapid-crash loops:
 
 Clean exits (return code 0) do not trigger a restart — the user quit the
 tray icon deliberately. Any non-zero exit triggers restart with backoff.
+
+Scheduled recycle
+-----------------
+The long-running service process slowly accrues memory (~9 MB/hour observed
+in production — likely pywin32 COM proxy buildup from the periodic Outlook
+re-Dispatch). To cap that, the supervisor terminates and respawns the child
+once it has been alive longer than _MAX_CHILD_AGE_SECONDS, but only during
+the quiet-hours window (_QUIET_HOUR_START..._QUIET_HOUR_END, local time) so
+the brief tray-icon flicker happens overnight.
 """
 
 from __future__ import annotations
@@ -139,10 +148,62 @@ _BACKOFF_LADDER = [0, 5, 30, 120, 300]
 # If the child runs longer than this before exiting, reset the backoff counter.
 _HEALTHY_RUN_SECONDS = 120
 
+# Scheduled recycle: terminate + respawn the child once it has been alive
+# this long. Caps memory growth from the slow COM-proxy leak in the main
+# service process. Picked at 3 days × ~9 MB/h ≈ 700 MB ceiling.
+_MAX_CHILD_AGE_SECONDS = 3 * 24 * 3600
+
+# Quiet-hours window (local time, 24h). The recycle waits for this window
+# so the brief tray-icon flicker happens overnight, not during a workday.
+# Half-open interval [_QUIET_HOUR_START, _QUIET_HOUR_END).
+_QUIET_HOUR_START = 2   # 02:00
+_QUIET_HOUR_END = 5     # 05:00
+
+# How long to give the child to exit gracefully after terminate() before
+# we resort to kill().
+_TERMINATE_GRACE_SECONDS = 30
+
+# Poll interval while waiting on the child. Coarse — we only check age and
+# alive status, no need for fine granularity.
+_POLL_INTERVAL_SECONDS = 60
+
+
+def _is_quiet_hours(now: datetime | None = None) -> bool:
+    """Return True if the local clock is currently inside the quiet window."""
+    h = (now or datetime.now()).hour
+    return _QUIET_HOUR_START <= h < _QUIET_HOUR_END
+
+
+def _terminate_child(proc: subprocess.Popen) -> int:
+    """Ask the child to exit, then kill if it doesn't. Returns the exit code."""
+    try:
+        proc.terminate()
+    except Exception as exc:
+        logger.warning(f"terminate() raised {exc}; falling through to kill")
+    try:
+        return proc.wait(timeout=_TERMINATE_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        logger.warning(
+            f"Child (pid={proc.pid}) did not exit within {_TERMINATE_GRACE_SECONDS}s; killing"
+        )
+        try:
+            proc.kill()
+        except Exception as exc:
+            logger.error(f"kill() raised {exc}")
+        try:
+            return proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            logger.error(f"Child (pid={proc.pid}) survived kill; abandoning")
+            return -1
+
 
 def _supervise():
     child_cmd = _find_child_cmd()
     logger.info(f"Child command: {child_cmd}")
+    logger.info(
+        f"Scheduled recycle: every {_MAX_CHILD_AGE_SECONDS//3600}h, "
+        f"during quiet hours [{_QUIET_HOUR_START:02d}:00-{_QUIET_HOUR_END:02d}:00)"
+    )
 
     crash_count = 0
     while True:
@@ -170,9 +231,32 @@ def _supervise():
             continue
 
         logger.info(f"Child started (pid={proc.pid})")
-        rc = proc.wait()
+
+        # Poll the child until it exits, or until we decide to recycle it.
+        recycled = False
+        while True:
+            rc = proc.poll()
+            if rc is not None:
+                break  # child exited on its own
+            age = time.monotonic() - started_at
+            if age >= _MAX_CHILD_AGE_SECONDS and _is_quiet_hours():
+                logger.info(
+                    f"Scheduled recycle: child (pid={proc.pid}) reached age "
+                    f"{age:.0f}s during quiet hours; terminating"
+                )
+                rc = _terminate_child(proc)
+                recycled = True
+                break
+            time.sleep(_POLL_INTERVAL_SECONDS)
+
         run_duration = time.monotonic() - started_at
         logger.info(f"Child exited (pid={proc.pid}) code={rc} after {run_duration:.0f}s")
+
+        if recycled:
+            # We killed it on purpose. Restart immediately, do not bump backoff.
+            logger.info("Restarting child after scheduled recycle")
+            crash_count = 0
+            continue
 
         if rc == 0:
             logger.info("Child exited cleanly (user quit). Supervisor exiting.")
