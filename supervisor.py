@@ -84,6 +84,41 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# User-visible notifications (ctypes only — this exe bundles no pywin32)
+# ---------------------------------------------------------------------------
+
+_MB_ICONWARNING = 0x00000030
+_MB_ICONINFORMATION = 0x00000040
+_MB_TOPMOST = 0x00040000
+_MB_SETFOREGROUND = 0x00010000
+
+
+def _show_message(text: str, flags: int):
+    """Show a blocking MessageBox. Never raises (best effort)."""
+    try:
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(None, text, "Transcripteur vocal", flags)
+    except Exception:
+        pass
+
+
+def _is_elevated() -> bool:
+    """True when this process runs with an elevated (administrator) token.
+
+    Children inherit our token, so an elevated supervisor means an elevated
+    service — which cannot connect to the user's non-elevated Outlook
+    ('Server execution failed' on every COM Dispatch, incident 2026-06-10).
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Single-instance lock
 # ---------------------------------------------------------------------------
 
@@ -287,7 +322,34 @@ def main() -> int:
     logger.info("Voicemail Transcriber Supervisor starting")
     logger.info("=" * 60)
 
+    if _is_elevated():
+        logger.error(
+            "Refusing to run elevated (as administrator): the service would "
+            "inherit the elevated token and Outlook COM would be unreachable. "
+            "Relaunch normally."
+        )
+        _show_message(
+            "Le Transcripteur de messages vocaux ne doit pas être exécuté "
+            "en tant qu'administrateur.\n\n"
+            "Un processus élevé ne peut pas communiquer avec Outlook : "
+            "aucun message vocal ne serait traité.\n\n"
+            "Veuillez relancer l'application normalement, sans "
+            "« Exécuter en tant qu'administrateur ».",
+            _MB_ICONWARNING | _MB_TOPMOST | _MB_SETFOREGROUND,
+        )
+        return 3
+
     if not _acquire_single_instance_lock():
+        # Visible feedback: on 2026-06-10 the silent exit here made the user
+        # believe the app was broken and escalate to "run as administrator".
+        _show_message(
+            "Le Transcripteur de messages vocaux est déjà en cours "
+            "d'exécution.\n\n"
+            "L'icône se trouve dans la zone de notification de la barre "
+            "des tâches. Si l'application vient d'être fermée, attendez "
+            "quelques instants avant de la relancer.",
+            _MB_ICONINFORMATION | _MB_TOPMOST | _MB_SETFOREGROUND,
+        )
         return 1
 
     try:

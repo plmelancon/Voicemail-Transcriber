@@ -116,7 +116,13 @@ def _run_worker_mode(device: str, language: str) -> int:
     SubprocessTranscriber detects and treats as "this backend is dead".
     """
     import json
-    from resource_manager import create_transcriber  # noqa: E402
+    from resource_manager import WORKER_FATAL_EXIT_ENV, create_transcriber  # noqa: E402
+
+    # Arm the fatal-device fast-exit BEFORE the backend is created: on a
+    # DEVICE_LOST-class error the backend calls os._exit(3) instead of
+    # unwinding (which froze the worker on 2026-06-10). The parent treats
+    # the death as WorkerCrashedError and retries on CPU within seconds.
+    os.environ[WORKER_FATAL_EXIT_ENV] = "1"
 
     logger.info(f"[Worker] Starting worker mode on device={device}")
     try:
@@ -191,6 +197,50 @@ from tray_app import VoicemailTrayApp  # noqa: E402
 from subprocess_transcriber import SubprocessTranscriber  # noqa: E402
 
 
+def _is_elevated() -> bool:
+    """True when this process runs with an elevated (administrator) token.
+
+    An elevated process cannot connect to the user's non-elevated Outlook:
+    every COM Dispatch fails with 'Server execution failed' (-2146959355),
+    so the service would run as a zombie that never sees a voicemail
+    (incident 2026-06-10, 2.5 hours of silent non-operation).
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def _refuse_elevated_start() -> bool:
+    """If elevated, log + show a warning and return True (caller must exit)."""
+    if not _is_elevated():
+        return False
+    logger.error(
+        "Refusing to start: process is elevated (run as administrator). "
+        "Outlook COM is unreachable from an elevated process; no voicemail "
+        "would ever be transcribed. Relaunch normally."
+    )
+    try:
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(
+            None,
+            "Le Transcripteur de messages vocaux ne doit pas être exécuté "
+            "en tant qu'administrateur.\n\n"
+            "Un processus élevé ne peut pas communiquer avec Outlook : "
+            "aucun message vocal ne serait traité.\n\n"
+            "Veuillez relancer l'application normalement, sans "
+            "« Exécuter en tant qu'administrateur ».",
+            "Transcripteur vocal",
+            0x00000030 | 0x00040000 | 0x00010000,  # MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND
+        )
+    except Exception:
+        pass
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Service de transcription automatique des messages vocaux"
@@ -228,6 +278,11 @@ def main():
     logger.info("=" * 60)
     logger.info("  Voicemail Transcriber Service starting")
     logger.info("=" * 60)
+
+    # Exit code 0 on refusal: if a supervisor spawned us, a clean exit means
+    # "user quit" and prevents a refuse/restart loop.
+    if _refuse_elevated_start():
+        return
 
     # 1. Build the processor reusing existing CONFIG
     processor = OutlookVoicemailProcessor(CONFIG)

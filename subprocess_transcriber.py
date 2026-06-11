@@ -248,8 +248,21 @@ class _WorkerProcess:
             return resp.get("text", "")
 
     def shutdown(self, timeout: float = 5.0):
-        """Send a graceful shutdown request, then kill on timeout."""
-        with self._lock:
+        """Send a graceful shutdown request, then kill on timeout.
+
+        The worker lock is held for the entire duration of an in-flight
+        transcription (up to RESPONSE_TIMEOUT). Waiting for it here is what
+        blocked the tray Quit for ~8 minutes on 2026-06-10, so if the lock
+        is busy we kill immediately instead of shutting down gracefully.
+        """
+        if not self._lock.acquire(timeout=1.0):
+            logger.warning(
+                "[SubprocessTranscriber] Worker busy (request in flight); "
+                "killing instead of graceful shutdown"
+            )
+            self.kill_nowait()
+            return
+        try:
             if not self.is_alive():
                 self._proc = None
                 return
@@ -266,6 +279,25 @@ class _WorkerProcess:
                 logger.warning("[SubprocessTranscriber] Worker did not exit in %ds, killing", timeout)
                 self._kill()
             self._proc = None
+        finally:
+            self._lock.release()
+
+    def kill_nowait(self):
+        """Kill the worker immediately WITHOUT acquiring the worker lock.
+
+        Safe to call from any thread while a transcription is in flight:
+        the death closes the stdout pipe, the in-flight reader gets EOF and
+        the blocked transcribe() raises WorkerCrashedError right away.
+        ``self._proc`` is left in place so that thread can read the exit
+        code; callers discard this _WorkerProcess afterwards.
+        """
+        proc = self._proc
+        if proc is None:
+            return
+        try:
+            proc.kill()
+        except Exception:
+            pass
 
     def _kill(self):
         if self._proc is None:
@@ -312,6 +344,7 @@ class SubprocessTranscriber:
         self._worker: _WorkerProcess | None = None
         self._worker_device: str | None = None  # device the current worker was spawned with
         self._lock = threading.Lock()
+        self._closing = False  # set by force_unload: no new workers after this
 
     # ----- public interface (duck-types WhisperModelManager) -----------------
 
@@ -348,6 +381,10 @@ class SubprocessTranscriber:
                 self._retry.record_cpu_fail(entry_id)
                 raise
             self._retry.record_npu_gpu_fail(entry_id)
+            if self._closing:
+                # Quit in progress — don't spawn a CPU retry worker that
+                # would outlive the service (observed 2026-06-10 11:12).
+                raise
             logger.info("[SubprocessTranscriber] Retrying immediately on CPU")
             try:
                 text = self._attempt("cpu", audio_path)
@@ -381,20 +418,32 @@ class SubprocessTranscriber:
                 self._worker_device = None
 
     def force_unload(self):
-        """Shut down the worker. Called on service quit."""
-        with self._lock:
-            if self._worker is not None:
-                try:
-                    self._worker.shutdown(timeout=5.0)
-                except Exception:
-                    pass
+        """Shut down the worker. Called on service quit.
+
+        Must NEVER block: our own lock can be held for up to
+        RESPONSE_TIMEOUT by a thread spawning a worker (cold model load),
+        and the worker's lock by an in-flight transcription. Kill first,
+        lock-free; the in-flight request fails fast with
+        WorkerCrashedError and, because _closing is set, no CPU-retry
+        worker is respawned mid-shutdown.
+        """
+        self._closing = True
+        worker = self._worker
+        if worker is not None:
+            worker.kill_nowait()
+        if self._lock.acquire(timeout=1.0):
+            try:
                 self._worker = None
                 self._worker_device = None
+            finally:
+                self._lock.release()
 
     # ----- internals ---------------------------------------------------------
 
     def _attempt(self, device: str, audio_path: str) -> str:
         """Ensure a worker is running on the requested device, then transcribe."""
+        if self._closing:
+            raise WorkerCrashedError("service is shutting down")
         with self._lock:
             if self._worker is None or self._worker_device != device or not self._worker.is_alive():
                 # Shut down any existing worker on a different device first

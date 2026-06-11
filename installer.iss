@@ -1,7 +1,7 @@
 ; Inno Setup Script for Voicemail Transcriber
 ; Build with: "C:\Users\PLM_Lacoursière\AppData\Local\Programs\Inno Setup 6\ISCC.exe" installer.iss
 
-#define MyAppVersion "0.1.0"
+#define MyAppVersion "0.1.1"
 
 [Setup]
 AppName=Transcripteur Vocal
@@ -48,7 +48,10 @@ Name: "startup"; Description: "Lancer automatiquement au demarrage de Windows"; 
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "VoicemailTranscriber"; ValueData: """{app}\VoicemailSupervisor.exe"""; Flags: uninsdeletevalue; Tasks: startup
 
 [Run]
-Filename: "{app}\VoicemailSupervisor.exe"; Description: "Lancer Transcripteur Vocal maintenant"; Flags: nowait postinstall skipifsilent
+; runasoriginaluser is REQUIRED: the installer runs elevated and without it
+; the supervisor would inherit the elevated token — and since v0.1.1 refuse
+; to start (elevated processes cannot reach Outlook COM, incident 2026-06-10).
+Filename: "{app}\VoicemailSupervisor.exe"; Description: "Lancer Transcripteur Vocal maintenant"; Flags: nowait postinstall skipifsilent runasoriginaluser
 
 [UninstallRun]
 ; Kill supervisor FIRST so it doesn't respawn the service mid-uninstall,

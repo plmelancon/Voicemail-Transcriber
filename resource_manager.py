@@ -70,6 +70,54 @@ def set_normal_priority():
 
 
 # ---------------------------------------------------------------------------
+# Worker fatal-device fast-exit (incident 2026-06-10)
+# ---------------------------------------------------------------------------
+# When a transcription runs inside a --worker subprocess and the NPU/GPU dies
+# (e.g. Level Zero ZE_RESULT_ERROR_DEVICE_LOST), letting the exception unwind
+# normally is NOT safe: native cleanup during unwinding can block in kernel
+# mode while holding the GIL, freezing the whole worker silently (observed
+# 2026-06-10: the worker logged the error, then froze for the parent's full
+# 10-minute hang timeout). The worker therefore dies instantly with
+# os._exit(3) instead. The parent (SubprocessTranscriber) sees the process
+# death as a WorkerCrashedError and retries on CPU within seconds.
+#
+# The error response must NOT be written to stdout before exiting: a
+# well-formed error response is treated as a non-crash WorkerProtocolError,
+# which does not trigger the CPU retry.
+
+WORKER_FATAL_EXIT_ENV = "VMT_WORKER_FATAL_EXIT"
+
+FATAL_DEVICE_KEYWORDS = (
+    # Intel NPU / Level Zero
+    "ZE_RESULT_ERROR_DEVICE_LOST", "DEVICE_LOST", "DEVICE_HUNG", "device hung",
+    # CUDA / cuDNN
+    "CUDA", "cuda", "CUBLAS", "CUDNN", "cudnn",
+    "out of memory", "device-side assert",
+)
+
+
+def exit_worker_now_if_fatal_device_error(exc: Exception):
+    """In --worker mode, kill the process before a fatal device error can
+    freeze it during exception unwinding. No-op outside worker mode (the
+    env flag is set only by ``voicemail_service.py --worker``)."""
+    if os.environ.get(WORKER_FATAL_EXIT_ENV) != "1":
+        return
+    msg = str(exc)
+    if not any(k in msg for k in FATAL_DEVICE_KEYWORDS):
+        return
+    logger.error(
+        "Fatal device error in worker, exiting immediately so the service "
+        "retries on CPU: %s", msg[:300],
+    )
+    for handler in logging.getLogger().handlers:
+        try:
+            handler.flush()
+        except Exception:
+            pass
+    os._exit(3)
+
+
+# ---------------------------------------------------------------------------
 # Whisper model manager (faster-whisper, with idle auto-unload)
 # ---------------------------------------------------------------------------
 
@@ -262,6 +310,7 @@ class GpuWhisperManager:
                 return text
             except Exception as e:
                 logger.error(f"Transcription error: {e}")
+                exit_worker_now_if_fatal_device_error(e)
                 raise
 
     def force_unload(self):
@@ -422,7 +471,11 @@ class NpuWhisperManager:
         """
         self._ready.wait()
         if self._load_error:
-            raise RuntimeError(f"NPU pipeline failed to load: {self._load_error}")
+            err = RuntimeError(f"NPU pipeline failed to load: {self._load_error}")
+            # A DEVICE_LOST load failure would otherwise surface as a
+            # WorkerProtocolError (no CPU retry); die so the parent retries.
+            exit_worker_now_if_fatal_device_error(err)
+            raise err
 
         with self._lock:
             logger.info(f"Transcribing: {audio_path}")
@@ -440,6 +493,10 @@ class NpuWhisperManager:
                 return text
             except Exception as e:
                 logger.error(f"Transcription error: {e}")
+                # Must run BEFORE the raise: unwinding past this frame after
+                # DEVICE_LOST froze the worker on 2026-06-10 (native cleanup
+                # holding the GIL).
+                exit_worker_now_if_fatal_device_error(e)
                 raise
 
     def force_unload(self):
