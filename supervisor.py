@@ -122,13 +122,76 @@ def _is_elevated() -> bool:
 # Single-instance lock
 # ---------------------------------------------------------------------------
 
+# Session-local named mutex: atomic, race-free, and released by the OS the
+# instant the process dies — no stale state possible. The pid file is kept
+# purely as a diagnostic (who holds the lock), never as the decision source.
+_MUTEX_NAME = "VoicemailTranscriberSupervisor"
+_ERROR_ALREADY_EXISTS = 183
+_mutex_handle = None  # kept for the life of the process; OS releases on exit
+
+
 def _acquire_single_instance_lock() -> bool:
     """Return True if we are the only supervisor running.
 
-    Uses a pid file. On Windows, opening a file with exclusive share mode
-    would be cleaner but a simple pid file is enough here — two supervisors
-    racing is a rare configuration error, not a routine event.
+    On Windows this uses a named mutex (two supervisors launched in the same
+    second both used to get past the old pid-file check, 2026-04-13). On
+    other platforms it falls back to the pid-file scheme.
     """
+    global _mutex_handle
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            # use_last_error=True captures GetLastError immediately after the
+            # call; reading it via ctypes.windll...GetLastError() later is
+            # unreliable (ctypes housekeeping can overwrite the thread error).
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+            k32.CreateMutexW.restype = wintypes.HANDLE
+            k32.CloseHandle.argtypes = [wintypes.HANDLE]
+            k32.CloseHandle.restype = wintypes.BOOL
+
+            handle = k32.CreateMutexW(None, False, _MUTEX_NAME)
+            last_error = ctypes.get_last_error()
+            if handle and last_error == _ERROR_ALREADY_EXISTS:
+                k32.CloseHandle(handle)
+                logger.warning("Another supervisor is already running (mutex held). Exiting.")
+                return False
+            if handle:
+                _mutex_handle = handle
+                _write_pid_file_diagnostic()
+                return True
+            logger.warning(
+                f"CreateMutexW failed (error={last_error}); "
+                "falling back to pid-file lock"
+            )
+        except Exception as exc:
+            logger.warning(f"Mutex acquisition raised {exc}; falling back to pid-file lock")
+    return _acquire_pid_file_lock()
+
+
+def _write_pid_file_diagnostic():
+    """Record our pid next to the mutex, and log stale-lock takeovers."""
+    try:
+        LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+        if LOCK_FILE.exists():
+            try:
+                old_pid = int(LOCK_FILE.read_text().strip())
+                if not _pid_is_running(old_pid):
+                    logger.info(
+                        f"Stale lockfile taken over (previous supervisor pid={old_pid} "
+                        "is not running — likely killed rather than exited cleanly)"
+                    )
+            except (ValueError, OSError):
+                logger.info("Unreadable lockfile taken over")
+        LOCK_FILE.write_text(str(os.getpid()))
+    except Exception as exc:
+        logger.warning(f"Could not write pid file ({exc}); continuing (mutex is the real lock)")
+
+
+def _acquire_pid_file_lock() -> bool:
+    """Legacy pid-file lock — non-Windows fallback only."""
     try:
         LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
         if LOCK_FILE.exists():
@@ -168,6 +231,18 @@ def _pid_is_running(pid: int) -> bool:
 
 
 def _release_lock():
+    global _mutex_handle
+    if _mutex_handle:
+        try:
+            import ctypes
+            from ctypes import wintypes
+            k32 = ctypes.WinDLL("kernel32")
+            k32.CloseHandle.argtypes = [wintypes.HANDLE]
+            k32.CloseHandle.restype = wintypes.BOOL
+            k32.CloseHandle(_mutex_handle)
+        except Exception:
+            pass
+        _mutex_handle = None
     try:
         LOCK_FILE.unlink(missing_ok=True)
     except Exception:
@@ -194,6 +269,11 @@ _MAX_CHILD_AGE_SECONDS = 3 * 24 * 3600
 _QUIET_HOUR_START = 2   # 02:00
 _QUIET_HOUR_END = 5     # 05:00
 
+# Hard ceiling: if the machine is always asleep during quiet hours, the
+# window-gated recycle never fires and the memory leak grows unbounded.
+# Past 2x the target age, recycle regardless of the time of day.
+_FORCE_RECYCLE_AGE_SECONDS = 2 * _MAX_CHILD_AGE_SECONDS
+
 # How long to give the child to exit gracefully after terminate() before
 # we resort to kill().
 _TERMINATE_GRACE_SECONDS = 30
@@ -207,6 +287,13 @@ def _is_quiet_hours(now: datetime | None = None) -> bool:
     """Return True if the local clock is currently inside the quiet window."""
     h = (now or datetime.now()).hour
     return _QUIET_HOUR_START <= h < _QUIET_HOUR_END
+
+
+def _should_recycle(age: float, now: datetime | None = None) -> bool:
+    """Recycle when aged past max during quiet hours, or unconditionally at 2x."""
+    if age >= _FORCE_RECYCLE_AGE_SECONDS:
+        return True
+    return age >= _MAX_CHILD_AGE_SECONDS and _is_quiet_hours(now)
 
 
 def _terminate_child(proc: subprocess.Popen) -> int:
@@ -274,10 +361,11 @@ def _supervise():
             if rc is not None:
                 break  # child exited on its own
             age = time.monotonic() - started_at
-            if age >= _MAX_CHILD_AGE_SECONDS and _is_quiet_hours():
+            if _should_recycle(age):
                 logger.info(
                     f"Scheduled recycle: child (pid={proc.pid}) reached age "
-                    f"{age:.0f}s during quiet hours; terminating"
+                    f"{age:.0f}s ({'quiet hours' if _is_quiet_hours() else 'forced, 2x max age'}); "
+                    "terminating"
                 )
                 rc = _terminate_child(proc)
                 recycled = True

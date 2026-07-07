@@ -10,6 +10,7 @@ Auteur: Claude pour Pierre-Luc Melancon
 import os
 import sys
 import tempfile
+import threading
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -123,7 +124,13 @@ class OutlookVoicemailProcessor:
         )
         self.outlook = None
         self.namespace = None
-        
+        # EntryIDs currently being transcribed. Three intake paths (ItemAdd
+        # monitor, catch-up scan, periodic poll) share this processor; the
+        # [TRANSCRIT] marker is only written AFTER transcription, so without
+        # this guard two paths routinely transcribe the same voicemail.
+        self._in_flight: set = set()
+        self._in_flight_lock = threading.Lock()
+
     def connect_outlook(self):
         """Etablit la connexion avec Outlook"""
         if self.outlook is None:
@@ -204,7 +211,6 @@ class OutlookVoicemailProcessor:
     def process_single_email(self, mail_item) -> bool:
         """Traite un seul courriel de messagerie vocale"""
         subject = mail_item.Subject or "(Sans sujet)"
-        logger.info(f"Traitement: {subject}")
 
         # EntryID is used by SubprocessTranscriber for per-voicemail retry
         # bookkeeping. Safe to read up-front; the item is already delivered.
@@ -212,6 +218,25 @@ class OutlookVoicemailProcessor:
             entry_id = mail_item.EntryID or ""
         except Exception:
             entry_id = ""
+
+        # In-flight guard: another intake path is already transcribing this
+        # item. Marker-based dedup can't catch this case (the marker is only
+        # written after transcription completes).
+        if entry_id:
+            with self._in_flight_lock:
+                if entry_id in self._in_flight:
+                    logger.info(f"Deja en cours de traitement, ignore: {subject}")
+                    return False
+                self._in_flight.add(entry_id)
+        try:
+            return self._process_single_email_guarded(mail_item, subject, entry_id)
+        finally:
+            if entry_id:
+                with self._in_flight_lock:
+                    self._in_flight.discard(entry_id)
+
+    def _process_single_email_guarded(self, mail_item, subject: str, entry_id: str) -> bool:
+        logger.info(f"Traitement: {subject}")
 
         audio_path, audio_filename = self.extract_audio_attachment(mail_item)
         if not audio_path:
@@ -297,7 +322,23 @@ class OutlookVoicemailProcessor:
 
         for mail in voicemails:
             try:
-                success = self.process_single_email(mail)
+                # Re-fetch a FRESH copy before processing: the snapshot from
+                # find_voicemails may predate another path's transcription of
+                # this item (stale subject = stale [TRANSCRIT] marker).
+                fresh = mail
+                try:
+                    _, namespace = self.connect_outlook()
+                    fresh = namespace.GetItemFromID(mail.EntryID, mail.Parent.StoreID)
+                except Exception:
+                    fresh = mail  # fall back to the snapshot object
+                if not self.is_voicemail(fresh):
+                    logger.info(
+                        f"Deja traite entre le scan et le traitement, ignore: "
+                        f"{fresh.Subject or '(Sans sujet)'}"
+                    )
+                    results["skipped"] += 1
+                    continue
+                success = self.process_single_email(fresh)
                 if success:
                     results["processed"] += 1
                 else:
