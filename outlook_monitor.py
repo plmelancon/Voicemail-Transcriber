@@ -112,20 +112,47 @@ class OutlookMonitor:
             try:
                 import win32com.client
 
+                from voicemail_transcriber import collect_store_inboxes
+
                 outlook = win32com.client.DispatchWithEvents(
                     "Outlook.Application", _OutlookAppEvents
                 )
                 namespace = outlook.GetNamespace("MAPI")
-                inbox = namespace.GetDefaultFolder(6)
-                items = inbox.Items
 
-                # Create the event handler and bind it
+                # Hook the Inbox of EVERY store in the profile so voicemails
+                # landing in any mailbox are caught. Falls back to the default
+                # store's Inbox if store enumeration yields nothing.
+                inboxes = collect_store_inboxes(namespace)
+                if not inboxes:
+                    logger.warning(
+                        "Store enumeration yielded nothing; falling back to "
+                        "the default store's Inbox"
+                    )
+                    inboxes = [("(default store)", namespace.GetDefaultFolder(6))]
+
+                # Bind one ItemAdd sink per Inbox. Keep references to BOTH the
+                # Items collections and the sinks — the COM connection points
+                # only stay alive while these are referenced.
                 handler = _make_items_events_class(self)
-                sink = win32com.client.WithEvents(items, handler)  # noqa: F841
+                hooked = []  # noqa: F841 — held for the pump's lifetime
+                for store_name, inbox in inboxes:
+                    try:
+                        items = inbox.Items
+                        sink = win32com.client.WithEvents(items, handler)
+                        hooked.append((store_name, items, sink))
+                        logger.info("Listening for new emails in: %s", store_name)
+                    except pythoncom.com_error as hook_err:
+                        logger.warning(
+                            "Could not hook Inbox of %s: %s", store_name, hook_err
+                        )
+                if not hooked:
+                    raise RuntimeError("No Inbox could be hooked in any store")
 
                 consecutive_failures = 0
                 self.on_status_change("idle", "")
-                logger.info("Connected to Outlook, listening for new emails")
+                logger.info(
+                    "Connected to Outlook, listening on %d mailbox(es)", len(hooked)
+                )
 
                 # Message pump — keeps COM callbacks alive
                 last_heartbeat = time.monotonic()

@@ -70,6 +70,36 @@ CONFIG = {
 # CLASSES ET FONCTIONS
 # ============================================================================
 
+def collect_store_inboxes(namespace) -> list:
+    """Enumere la Boite de reception de chaque store du profil Outlook.
+
+    Retourne une liste de tuples (nom_du_store, dossier_inbox). Les stores
+    sans boite de reception accessible (archives en ligne, dossiers publics,
+    PST deconnectes...) sont ignores individuellement — une boite cassee ne
+    doit jamais empecher de surveiller les autres.
+    """
+    inboxes = []
+    try:
+        stores = namespace.Stores
+        count = stores.Count
+    except Exception as e:
+        logger.warning(f"Enumeration des stores impossible: {e}")
+        return inboxes
+
+    for i in range(1, count + 1):  # collections COM: index 1-base
+        store_name = f"store #{i}"
+        try:
+            store = stores.Item(i)
+            store_name = store.DisplayName or store_name
+            inbox = store.GetDefaultFolder(6)  # 6 = olFolderInbox
+            inboxes.append((store_name, inbox))
+        except Exception as e:
+            logger.info(
+                f"Store sans boite de reception accessible, ignore ({store_name}): {e}"
+            )
+    return inboxes
+
+
 class WhisperTranscriber:
     """Gere la transcription audio avec Whisper"""
     
@@ -244,38 +274,59 @@ class OutlookVoicemailProcessor:
                 logger.warning(f"Impossible de supprimer le fichier temporaire: {e}")
     
     def get_inbox_folder(self):
-        """Recupere le dossier Boite de reception"""
+        """Recupere le dossier Boite de reception (store par defaut)"""
         _, namespace = self.connect_outlook()
         return namespace.GetDefaultFolder(6)  # 6 = olFolderInbox
 
+    def get_inbox_folders(self) -> list:
+        """Recupere la Boite de reception de CHAQUE store du profil.
+
+        Retombe sur la boite du store par defaut si l'enumeration des
+        stores echoue completement.
+        """
+        _, namespace = self.connect_outlook()
+        inboxes = collect_store_inboxes(namespace)
+        if not inboxes:
+            logger.warning(
+                "Aucune boite trouvee via les stores; repli sur le store par defaut"
+            )
+            inboxes = [("(store par defaut)", namespace.GetDefaultFolder(6))]
+        return inboxes
 
     def find_voicemails(self, days_back: int = None) -> list:
-        """Trouve tous les messages vocaux non traites"""
+        """Trouve tous les messages vocaux non traites (toutes les boites)"""
         if days_back is None:
             days_back = self.config["days_to_search"]
-        
-        inbox = self.get_inbox_folder()
-        
+
         cutoff_date = datetime.now() - timedelta(days=days_back)
         cutoff_str = cutoff_date.strftime("%m/%d/%Y")
-        
+
         restriction = f"[ReceivedTime] >= '{cutoff_str}'"
-        
+
         voicemails = []
-        items = inbox.Items.Restrict(restriction)
-        items.Sort("[ReceivedTime]", True)
-        
         logger.info(f"Recherche de messages vocaux depuis {cutoff_str}...")
-        
-        for item in items:
+
+        for store_name, inbox in self.get_inbox_folders():
             try:
-                if self.is_voicemail(item):
-                    voicemails.append(item)
-                    logger.debug(f"Message vocal trouve: {item.Subject}")
+                items = inbox.Items.Restrict(restriction)
+                items.Sort("[ReceivedTime]", True)
             except Exception as e:
-                logger.warning(f"Erreur lors de l'analyse d'un element: {e}")
+                logger.warning(
+                    f"Boite illisible, ignoree ({store_name}): {e}"
+                )
                 continue
-        
+
+            for item in items:
+                try:
+                    if self.is_voicemail(item):
+                        voicemails.append(item)
+                        logger.debug(
+                            f"Message vocal trouve ({store_name}): {item.Subject}"
+                        )
+                except Exception as e:
+                    logger.warning(f"Erreur lors de l'analyse d'un element: {e}")
+                    continue
+
         logger.info(f"{len(voicemails)} message(s) vocal(aux) trouve(s)")
         return voicemails
     
