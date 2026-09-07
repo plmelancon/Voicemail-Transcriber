@@ -1,7 +1,7 @@
 ; Inno Setup Script for Voicemail Transcriber
 ; Build with: "C:\Users\PLM_Lacoursière\AppData\Local\Programs\Inno Setup 6\ISCC.exe" installer.iss
 
-#define MyAppVersion "0.1.1"
+#define MyAppVersion "0.1.2"
 
 [Setup]
 AppName=Transcripteur Vocal
@@ -33,7 +33,7 @@ Source: "dist\VoicemailTranscriber\*"; DestDir: "{app}"; Flags: ignoreversion re
 Source: "dist\VoicemailSupervisor.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 ; Whisper model files (bundled for offline use)
-Source: "C:\Users\PLM_Lacoursière\.cache\huggingface\hub\models--mobiuslabsgmbh--faster-whisper-large-v3-turbo\snapshots\0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf\*"; DestDir: "{app}\models\faster-whisper-large-v3-turbo"; Flags: ignoreversion
+Source: "C:\Users\PLM-Travail\.cache\huggingface\hub\models--mobiuslabsgmbh--faster-whisper-large-v3-turbo\snapshots\0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf\*"; DestDir: "{app}\models\faster-whisper-large-v3-turbo"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\Transcripteur Vocal"; Filename: "{app}\VoicemailSupervisor.exe"; IconFilename: "{app}\VoicemailTranscriber.exe"
