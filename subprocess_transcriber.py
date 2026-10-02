@@ -17,6 +17,7 @@ Failure handling
   Never gives up. User requirement: "all voicemails must always be transcribed".
 """
 
+import collections
 import json
 import logging
 import os
@@ -112,6 +113,12 @@ class _WorkerProcess:
         self.language = language
         self._proc: subprocess.Popen | None = None
         self._lock = threading.Lock()
+        # Rolling tail of the worker's stderr, filled by a drainer thread.
+        # The pipe MUST be drained continuously: the worker logs to stderr
+        # (voicemail_service.py attaches a StreamHandler) and native libs
+        # write to fd 2 directly — an undrained pipe fills after a few KB
+        # and blocks the worker mid-request ("worker hung" false positives).
+        self._stderr_tail: collections.deque[str] = collections.deque(maxlen=200)
 
     def _spawn(self):
         """Launch the worker child and wait for its ready signal."""
@@ -135,6 +142,16 @@ class _WorkerProcess:
             bufsize=1,  # line-buffered
             creationflags=creationflags,
         )
+
+        # Continuously drain stderr so the worker can never block on a full
+        # pipe. The thread exits on EOF when the worker dies.
+        self._stderr_tail.clear()
+        threading.Thread(
+            target=self._drain_stderr,
+            args=(self._proc,),
+            name="WorkerStderr",
+            daemon=True,
+        ).start()
 
         # Read the ready handshake line
         ready_line = self._read_line_with_timeout(self.RESPONSE_TIMEOUT)
@@ -188,19 +205,30 @@ class _WorkerProcess:
     def is_alive(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
 
+    def _drain_stderr(self, proc: subprocess.Popen):
+        """Read the worker's stderr until EOF, keeping a rolling tail."""
+        try:
+            assert proc.stderr is not None
+            for line in proc.stderr:
+                line = line.rstrip("\n\r")
+                if line:
+                    self._stderr_tail.append(line)
+        except Exception:
+            pass
+
     def ensure_alive(self):
         """Spawn or respawn the worker if it isn't currently running."""
         with self._lock:
             if self.is_alive():
                 return
-            if self._proc is not None:
-                # Drain stderr for diagnostic purposes before spawning anew
-                try:
-                    stderr = self._proc.stderr.read() if self._proc.stderr else ""  # type: ignore[union-attr]
-                    if stderr:
-                        logger.warning("[SubprocessTranscriber] Previous worker stderr: %s", stderr[:2000])
-                except Exception:
-                    pass
+            if self._proc is not None and self._stderr_tail:
+                # Post-mortem diagnostics from the drainer's rolling tail.
+                # (Do NOT read the pipe here — the drainer thread owns it.)
+                tail = "\n".join(self._stderr_tail)
+                logger.warning(
+                    "[SubprocessTranscriber] Previous worker stderr (tail): %s",
+                    tail[-2000:],
+                )
             self._spawn()
 
     def transcribe(self, audio_path: str) -> str:

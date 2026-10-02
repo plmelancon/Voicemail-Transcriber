@@ -341,6 +341,10 @@ def main():
         try:
             while True:
                 threading.Event().wait(timeout=POLL_INTERVAL_MINUTES * 60)
+                if monitor.is_paused:
+                    # Honor the tray "Pause": without this check the poll
+                    # kept transcribing while the icon said "En pause".
+                    continue
                 try:
                     logger.info("Periodic poll: scanning last 24 hours...")
                     # Fresh COM connection for this thread
